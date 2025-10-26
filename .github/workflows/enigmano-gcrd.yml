@@ -57,16 +57,17 @@ jobs:
           $newUser      = "${{ inputs.NEW_USERNAME }}".Trim()
           $newPass      = "${{ inputs.NEW_PASSWORD }}".Trim()
           $pinInput     = "${{ inputs.GCRD_PIN }}".Trim()
-          $ttl          = [int]("${{ inputs.TTL_MINUTES }}")
-          if ($ttl -lt 10) { $ttl = 10 }  # sanity
+          $ttlStr       = "${{ inputs.TTL_MINUTES }}".Trim()
+          if (-not [int]::TryParse($ttlStr, [ref]$null)) { $ttlStr = "120" }
+          $ttl          = [int]$ttlStr
+          if ($ttl -lt 10) { $ttl = 10 }  # sanity guard
 
-          # Compute a deterministic 6-12 digit PIN from 'EnigMano'+INSTANCE if blank
+          # Compute a deterministic 12-digit PIN from 'EnigMano'+INSTANCE if blank
           if ([string]::IsNullOrWhiteSpace($pinInput)) {
             $seed = "EnigMano$instance"
             $sha  = [System.Security.Cryptography.SHA256]::Create()
             $buf  = [System.Text.Encoding]::UTF8.GetBytes($seed)
-            $hex  = ($sha.ComputeHash($buf) | ForEach-Object { ($_ % 10) }) -join ''
-            $pinInput = $hex.Substring(0,12)  # up to 12 digits allowed; client accepts >=6
+            $pinInput = (($sha.ComputeHash($buf) | ForEach-Object { $_ % 10 }) -join '').Substring(0,12)
           }
 
           # Decide target account + password
@@ -80,19 +81,21 @@ jobs:
           }
 
           # Mask sensitive values in logs
-          @($targetPass, $pinInput) | ForEach-Object { if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" } }
+          @($targetPass, $pinInput) | ForEach-Object {
+            if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" }
+          }
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { Write-Output "::add-mask::$($Matches[1])" }
-          if ($setupInput -match '4\/[0-9A-Za-z\-_]+') { Write-Output "::add-mask::$($Matches[0])" }
+          if ($setupInput -match '4\/[0-9A-Za-z\-_]+')        { Write-Output "::add-mask::$($Matches[0])" }
 
           # Persist for later steps
-          echo "INSTANCE=$instance"           | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "TARGET_USER=$targetUser"      | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "TARGET_PASS=$targetPass"      | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "PIN=$pinInput"                | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "SETUP_INPUT=$setupInput"      | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "REDIRECT_URL=$redirectUrl"    | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "TTL_MIN=$ttl"                 | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "HOST_NAME=EnigMano-$instance-${{ github.run_number }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INSTANCE=$instance"                                  | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TARGET_USER=$targetUser"                             | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TARGET_PASS=$targetPass"                             | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PIN=$pinInput"                                       | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SETUP_INPUT=$setupInput"                             | Out-File -FilePath $env:GITHUB_ENV -Append
+          "REDIRECT_URL=$redirectUrl"                           | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TTL_MIN=$ttl"                                        | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HOST_NAME=EnigMano-$instance-${{ github.run_number }}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Ensure target account exists and is admin
         shell: pwsh
@@ -116,11 +119,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # Enable RDP
+          # Enable RDP locally
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-          # Allow RDP through Windows Firewall
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          # Make sure the service is present & started
           Set-Service -Name TermService -StartupType Automatic
           Start-Service TermService
 
@@ -130,22 +131,21 @@ jobs:
           $ErrorActionPreference = "Stop"
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
           Invoke-WebRequest -Uri "${{ env.MSI_URL }}" -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+          # Install quietly
+          Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
           # Known path to start-host executable
           $exe = "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) { throw "remoting_start_host.exe not found at: $exe" }
-          echo "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Apply CRD stability policies (curtain, auth) and restart service
+      - name: Apply CRD stability policies and restart service
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # Google’s recommended Windows/Server settings for CRD hosts
           reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f
-          # Restart CRD host service if present
           sc.exe query chromoting > $null 2>&1
           if ($LASTEXITCODE -eq 0) {
             net stop chromoting
@@ -159,20 +159,15 @@ jobs:
           $exe = "$env:CRD_START_HOST"
           $name = "$env:HOST_NAME"
 
-          function Extract-Code([string]$s) {
+          function ExtractCode([string]$s) {
             if ($s -match 'code="?([0-9A-Za-z\/\-_]+)"?') { return $Matches[1] }
             if ($s -match '(^|[^A-Za-z0-9\/])(?<code>4\/[0-9A-Za-z\-_]+)($|[^A-Za-z0-9\-_])') { return $Matches['code'] }
             return $null
           }
 
-          $code = Extract-Code $env:SETUP_INPUT
+          $code = ExtractCode $env:SETUP_INPUT
           if (-not $code) {
-            throw @"
-No OAuth code detected.
-From https://remotedesktop.google.com/ (Set up via SSH), copy either:
-  • the entire Windows command containing --code=..., OR
-  • just the OAuth code that starts with '4/'.
-"@
+            throw "No OAuth code detected. Paste either the full command containing --code=... or the code starting with '4/'."
           }
 
           $pin = $env:PIN
@@ -190,8 +185,8 @@ From https://remotedesktop.google.com/ (Set up via SSH), copy either:
           Write-Output "::add-mask::$code"
           Write-Output "::add-mask::$pin"
 
-          echo "CRD_ARGS=$args" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CRD_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CRD_ARGS=$args" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CRD_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Register CRD host AS the target account (loads user profile)
         shell: pwsh
@@ -211,10 +206,12 @@ From https://remotedesktop.google.com/ (Set up via SSH), copy either:
         continue-on-error: true
         run: |
           Write-Host "=== Services ==="
-          Get-Service chromoting,TermService | Format-Table -Auto
-          Write-Host "`n=== Host entry ==="
+          Get-Service TermService -ErrorAction SilentlyContinue | Format-Table -Auto
+          $svc = Get-Service chromoting -ErrorAction SilentlyContinue
+          if ($svc) { $svc | Format-Table -Auto }
+          Write-Host "`n=== Host entry (tail) ==="
           $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
-          if (Test-Path $log) { Get-Content $log -Tail 50 }
+          if (Test-Path $log) { Get-Content $log -Tail 80 }
           Write-Host "`n=== Whoami / Groups ==="
           whoami /all
 
