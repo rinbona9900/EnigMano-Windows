@@ -50,11 +50,11 @@ jobs:
       GCRD_REDIRECT_URL_INPUT: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
 
     steps:
-      # 1) Warm-up (wait 50s) + Normalize inputs + Defaults
+      # 1) Warm-up + Normalize (writes env vars for later steps)
       - name: ✨ Warm-Up (50s) & Normalize
         shell: pwsh
         run: |
-          # --- Warm-up: ensure runner services are fully up before GCRD ---
+          # Warm-up
           Write-Host "🕒 Warming up runner for 50 seconds..."
           Start-Sleep -Seconds 50
 
@@ -70,25 +70,25 @@ jobs:
 
           function Fail($m){ Write-Error $m; exit 1 }
 
-          # Parse OAuth code: accept full command or just code
+          # Parse OAuth code: accept full command or just the code
           $raw = $env:SSH_CODE_OR_CMD
           if (-not $raw) { Fail "❌ Missing SSH_CODE_OR_CMD." }
           $code = $null
           if ($raw -match '--code="([^"]+)"') {
             $code = $Matches[1]
           } elseif ($raw -match '^\s*"%PROGRAMFILES\(X86\)%\\Google\\Chrome Remote Desktop\\CurrentVersion\\remoting_start_host\.exe"') {
-            Fail "❌ Could not parse --code from the provided command. Paste full command again or just the code."
+            Fail "❌ Could not parse --code from the provided command. Paste the full command again or just the code."
           } else {
             $code = $raw.Trim()
           }
           if (-not $code) { Fail "❌ Empty OAuth code after parsing." }
 
-          # Redirect (prefer provided, else from cmd, else default)
+          # Redirect URL
           $redirect = $env:GCRD_REDIRECT_URL_INPUT
           if (-not $redirect) { $redirect = "https://remotedesktop.google.com/_/oauthredirect" }
           if ($raw -match '--redirect-url="([^"]+)"') { $redirect = $Matches[1] }
 
-          # PIN: if numeric ≥6 use it; else map "EnigMano" to T9 digits
+          # PIN logic: numeric input or derived from "EnigMano"
           function Convert-ToT9($text){
             $map = @{
               'A'=2;'B'=2;'C'=2; 'D'=3;'E'=3;'F'=3; 'G'=4;'H'=4;'I'=4;
@@ -114,21 +114,21 @@ jobs:
           $user = if ($env:USERNAME_INPUT) { $env:USERNAME_INPUT } else { "runneradmin" }
           $pass = if ($env:PASSWORD_INPUT) { $env:PASSWORD_INPUT } else { "P@ssw0rd!" }
 
-          # Export to job env
+          # Persist to job env
           "GCRD_CODE=$code"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GCRD_REDIRECT=$redirect" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GCRD_PIN=$pin"           | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_USER=$user"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_PASS=$pass"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Mask sensitive
+          # Mask sensitive things in logs
           Write-Host "::add-mask::$code"
           Write-Host "::add-mask::$pass"
           Write-Host "::add-mask::$pin"
 
           Write-Host "::notice title=Normalized::User=$user | Redirect=$redirect | PIN source=$pinSrc"
 
-      # 2) ONE-STEP: Ensure admin → Install CRD → Register via elevated Scheduled Task → Verify
+      # 2) ONE STEP: Ensure admin → Install CRD → Register with elevated Scheduled Task using a short wrapper
       - name: 🔐 Install & Register Chrome Remote Desktop (one-step)
         shell: pwsh
         run: |
@@ -165,14 +165,26 @@ jobs:
           if (-not $exe) { Fail "❌ remoting_start_host.exe not found." }
           Write-Host "::notice title=CRD Path::Using '$exe'"
 
-          # Register via elevated Scheduled Task (runs as chosen admin)
+          # Write a SHORT WRAPPER PS1 to avoid the 261-char schtasks /TR limit
+          $wrapper = Join-Path $env:WINDIR "Temp\enigmano-crd-register.ps1"
+          $content = @"
+          # EnigMano CRD Registration Wrapper
+          \$exe = '$exe'
+          & \$exe --code="$($env:GCRD_CODE)" --redirect-url="$($env:GCRD_REDIRECT)" --name=\$env:COMPUTERNAME --pin=$($env:GCRD_PIN)
+          exit \$LASTEXITCODE
+"@
+          Set-Content -Path $wrapper -Value $content -Encoding ASCII
+          Write-Host "::notice title=Wrapper::Created $wrapper"
+
+          # Create elevated Scheduled Task that runs the wrapper (short /TR)
           $task = "EnigManoCRDRegister"
-          $tr   = "`"$exe`" --code=`"$($env:GCRD_CODE)`" --redirect-url=`"$($env:GCRD_REDIRECT)`" --name=$($env:COMPUTERNAME) --pin=$($env:GCRD_PIN)"
-          schtasks /Create /F /RL HIGHEST /SC ONCE /ST 23:59 /TN $task /TR "$tr" /RU "$($env:TARGET_USER)" /RP "$($env:TARGET_PASS)" | Out-Null
+          $start = (Get-Date).AddMinutes(1).ToString("HH:mm")
+          $tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$wrapper`""
+          schtasks /Create /F /RL HIGHEST /SC ONCE /ST $start /TN $task /TR "$tr" /RU "$($env:TARGET_USER)" /RP "$($env:TARGET_PASS)" | Out-Null
           schtasks /Run /TN $task | Out-Null
           Write-Host "🚀 CRD registration task launched as '$($env:TARGET_USER)'."
 
-          # Wait for completion & check host files / processes (up to ~2 minutes)
+          # Wait up to ~2 minutes for host to register
           $ok = $false
           for ($i=1; $i -le 24; $i++) {
             Start-Sleep -Seconds 5
@@ -184,7 +196,7 @@ jobs:
           }
           if ($ok) { Write-Host "✅ CRD host appears registered (host file present)." } else { Write-Host "::warning title=CRD::Host files not detected yet; check remotedesktop.google.com/access." }
 
-          # Clean up task
+          # Clean up task (wrapper kept for re-run if desired)
           schtasks /Delete /F /TN $task | Out-Null
 
       # 3) Download your EnigMano script from GitLab
