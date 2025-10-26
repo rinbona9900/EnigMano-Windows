@@ -24,7 +24,7 @@ on:
         required: false
         default: ""
       GCRD_REDIRECT_URL:
-        description: "Redirect URL from Google"
+        description: "Redirect URL from Google (leave default)"
         required: false
         default: "https://remotedesktop.google.com/_/oauthredirect"
       TTL_MINUTES:
@@ -44,6 +44,15 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     env:
+      # Move all user inputs into environment variables to avoid PowerShell parsing issues
+      INSTANCE: ${{ inputs.INSTANCE }}
+      RAW_SETUP: ${{ inputs.SETUP_CMD_OR_CODE }}
+      RAW_PIN: ${{ inputs.GCRD_PIN }}
+      RAW_NEW_USERNAME: ${{ inputs.NEW_USERNAME }}
+      RAW_NEW_PASSWORD: ${{ inputs.NEW_PASSWORD }}
+      RAW_REDIRECT_URL: ${{ inputs.GCRD_REDIRECT_URL }}
+      RAW_TTL: ${{ inputs.TTL_MINUTES }}
+
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
     steps:
       - name: Normalize inputs + derive defaults (safe masking)
@@ -51,18 +60,18 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $instance     = "${{ inputs.INSTANCE }}".Trim()
-          $setupInput   = "${{ inputs.SETUP_CMD_OR_CODE }}".Trim()
-          $redirectUrl  = "${{ inputs.GCRD_REDIRECT_URL }}".Trim()
-          $newUser      = "${{ inputs.NEW_USERNAME }}".Trim()
-          $newPass      = "${{ inputs.NEW_PASSWORD }}".Trim()
-          $pinInput     = "${{ inputs.GCRD_PIN }}".Trim()
-          $ttlStr       = "${{ inputs.TTL_MINUTES }}".Trim()
-          if (-not [int]::TryParse($ttlStr, [ref]$null)) { $ttlStr = "120" }
-          $ttl          = [int]$ttlStr
-          if ($ttl -lt 10) { $ttl = 10 }  # sanity guard
+          $instance     = ($env:INSTANCE   | ForEach-Object { $_.Trim() })
+          $setupInput   = ($env:RAW_SETUP  | ForEach-Object { $_.Trim() })
+          $redirectUrl  = ($env:RAW_REDIRECT_URL | ForEach-Object { $_.Trim() })
+          $newUser      = ($env:RAW_NEW_USERNAME | ForEach-Object { $_.Trim() })
+          $newPass      = ($env:RAW_NEW_PASSWORD | ForEach-Object { $_.Trim() })
+          $pinInput     = ($env:RAW_PIN    | ForEach-Object { $_.Trim() })
+          $ttlStr       = ($env:RAW_TTL    | ForEach-Object { $_.Trim() })
 
-          # Compute a deterministic 12-digit PIN from 'EnigMano'+INSTANCE if blank
+          if (-not [int]::TryParse($ttlStr, [ref]0)) { $ttlStr = "120" }
+          $ttl = [int]$ttlStr
+          if ($ttl -lt 10) { $ttl = 10 }
+
           if ([string]::IsNullOrWhiteSpace($pinInput)) {
             $seed = "EnigMano$instance"
             $sha  = [System.Security.Cryptography.SHA256]::Create()
@@ -70,7 +79,6 @@ jobs:
             $pinInput = (($sha.ComputeHash($buf) | ForEach-Object { $_ % 10 }) -join '').Substring(0,12)
           }
 
-          # Decide target account + password
           if ([string]::IsNullOrWhiteSpace($newUser)) {
             $targetUser = "runneradmin"
             $targetPass = if ([string]::IsNullOrWhiteSpace($newPass)) { "Enigman0" } else { $newPass }
@@ -80,22 +88,19 @@ jobs:
             $targetPass = $newPass
           }
 
-          # Mask sensitive values in logs
-          @($targetPass, $pinInput) | ForEach-Object {
-            if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" }
-          }
+          # Mask sensitive values
+          @($targetPass, $pinInput) | ForEach-Object { if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" } }
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { Write-Output "::add-mask::$($Matches[1])" }
           if ($setupInput -match '4\/[0-9A-Za-z\-_]+')        { Write-Output "::add-mask::$($Matches[0])" }
 
-          # Persist for later steps
-          "INSTANCE=$instance"                                  | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TARGET_USER=$targetUser"                             | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TARGET_PASS=$targetPass"                             | Out-File -FilePath $env:GITHUB_ENV -Append
-          "PIN=$pinInput"                                       | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SETUP_INPUT=$setupInput"                             | Out-File -FilePath $env:GITHUB_ENV -Append
-          "REDIRECT_URL=$redirectUrl"                           | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TTL_MIN=$ttl"                                        | Out-File -FilePath $env:GITHUB_ENV -Append
-          "HOST_NAME=EnigMano-$instance-${{ github.run_number }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INSTANCE=$instance"                                        | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TARGET_USER=$targetUser"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TARGET_PASS=$targetPass"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PIN=$pinInput"                                             | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SETUP_INPUT=$setupInput"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
+          "REDIRECT_URL=$redirectUrl"                                 | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TTL_MIN=$ttl"                                              | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HOST_NAME=EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"    | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Ensure target account exists and is admin
         shell: pwsh
@@ -119,7 +124,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # Enable RDP locally
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
@@ -130,10 +134,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
-          Invoke-WebRequest -Uri "${{ env.MSI_URL }}" -OutFile $msi
-          # Install quietly
+          Invoke-WebRequest -Uri "$env:MSI_URL" -OutFile $msi
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
-          # Known path to start-host executable
           $exe = "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) { throw "remoting_start_host.exe not found at: $exe" }
           "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -158,17 +160,16 @@ jobs:
           $ErrorActionPreference = "Stop"
           $exe = "$env:CRD_START_HOST"
           $name = "$env:HOST_NAME"
+          $inputText = "$env:SETUP_INPUT"
 
-          function ExtractCode([string]$s) {
+          function Extract-Code([string]$s) {
             if ($s -match 'code="?([0-9A-Za-z\/\-_]+)"?') { return $Matches[1] }
             if ($s -match '(^|[^A-Za-z0-9\/])(?<code>4\/[0-9A-Za-z\-_]+)($|[^A-Za-z0-9\-_])') { return $Matches['code'] }
             return $null
           }
 
-          $code = ExtractCode $env:SETUP_INPUT
-          if (-not $code) {
-            throw "No OAuth code detected. Paste either the full command containing --code=... or the code starting with '4/'."
-          }
+          $code = Extract-Code $inputText
+          if (-not $code) { throw "No OAuth code detected. Paste either the full command containing --code=... or the code starting with '4/'." }
 
           $pin = $env:PIN
           if ($pin.Length -lt 6) { throw "GCRD_PIN must be at least 6 digits." }
@@ -181,7 +182,6 @@ jobs:
             "--pin=""$pin"""
           ) -join " "
 
-          # Mask sensitive tokens in logs
           Write-Output "::add-mask::$code"
           Write-Output "::add-mask::$pin"
 
@@ -225,7 +225,7 @@ jobs:
           Write-Host "    then open: https://remotedesktop.google.com/access"
           Write-Host "    Your host should appear as: $env:CRD_NAME"
           Write-Host "-----------------------------------------------------"
-          Write-Host "Note: RDP service is enabled locally, but GitHub-hosted"
+          Write-Host "Note: RDP is enabled locally for completeness, but GitHub-hosted"
           Write-Host "runners do not accept inbound connections from the internet."
           Write-Host "Use Chrome Remote Desktop for access."
           Write-Host "====================================================="
