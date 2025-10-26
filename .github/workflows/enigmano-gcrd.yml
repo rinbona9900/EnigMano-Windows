@@ -7,15 +7,16 @@ on:
         description: "Instance number"
         required: true
         default: "1"
-      GCRD_CODE:
-        description: "Paste the 'Setup via SSH' OAuth code from remotedesktop.google.com"
+      SSH_CODE_OR_CMD:
+        description: "Paste the entire 'Setup via SSH' command OR just the OAuth code"
         required: true
+        default: ""
       GCRD_PIN:
-        description: "Optional numeric PIN (≥6 digits). Leave blank for no PIN."
+        description: "Optional numeric PIN (≥6 digits). Leave blank to omit."
         required: false
         default: ""
       GCRD_REDIRECT_URL:
-        description: "Redirect URL"
+        description: "Redirect URL (leave default unless Google changes it)"
         required: false
         default: "https://remotedesktop.google.com/_/oauthredirect"
 
@@ -28,15 +29,15 @@ jobs:
       actions: write
 
     env:
-      # Runtime/env for your PS1
+      # Core runtime for your PS1
       INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
       WORKFLOW_FILE: "enigmano-gcrd.yml"
       REPO: ${{ github.repository }}
       DEPLOYMENT_ID: ${{ github.run_id }}
       SECRET_SHAHZAIB: ${{ secrets.SECRET_SHAHZAIB }}
 
-      # Headless CRD registration inputs
-      GCRD_CODE: ${{ github.event.inputs.GCRD_CODE }}
+      # Raw input (either full CMD or just code)
+      SSH_CODE_OR_CMD: ${{ github.event.inputs.SSH_CODE_OR_CMD }}
       GCRD_PIN: ${{ github.event.inputs.GCRD_PIN }}
       GCRD_REDIRECT_URL: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
 
@@ -50,26 +51,54 @@ jobs:
           Write-Host "🖥️  Instance ID        : $env:INSTANCE_ID"
           Write-Host "==============================================="
 
-      - name: 🔐 Validate Inputs
+      - name: 🧪 Normalize GCRD Input (accepts full CMD or just code)
         shell: pwsh
         run: |
-          if (-not $env:GCRD_CODE) {
-            Write-Error "❌ Missing required GCRD_CODE (Setup via SSH OAuth code)."
+          $raw = $env:SSH_CODE_OR_CMD.Trim()
+          if (-not $raw) {
+            Write-Error "❌ Missing SSH_CODE_OR_CMD."
             exit 1
           }
-          if ($env:GCRD_PIN -and $env:GCRD_PIN.Length -lt 6) {
-            Write-Error "❌ GCRD_PIN must be at least 6 digits when provided."
+
+          # Defaults
+          $redirect = $env:GCRD_REDIRECT_URL
+          if (-not $redirect) {
+            $redirect = "https://remotedesktop.google.com/_/oauthredirect"
+          }
+
+          # If the user pasted the full command, extract --code and optional --redirect-url
+          $code = $null
+          if ($raw -match '--code="([^"]+)"') {
+            $code = $Matches[1]
+          } elseif ($raw -match '^\s*"%PROGRAMFILES\(X86\)%\\Google\\Chrome Remote Desktop\\CurrentVersion\\remoting_start_host\.exe"') {
+            Write-Error "❌ Could not parse --code from the provided command."
+            exit 1
+          } else {
+            # Assume they pasted just the OAuth code
+            $code = $raw
+          }
+
+          if (-not $code) {
+            Write-Error "❌ GCRD OAuth code is empty after parsing."
             exit 1
           }
-          if (-not $env:SECRET_SHAHZAIB) {
-            Write-Host "::warning title=Token not set::SECRET_SHAHZAIB is empty; workflow dispatch in the PS1 may fail."
+
+          # (Optional) if command included a different redirect-url, pick it up
+          if ($raw -match '--redirect-url="([^"]+)"') {
+            $redirect = $Matches[1]
           }
+
+          # Export normalized values to the job environment
+          "`nGCRD_CODE=$code"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "`nGCRD_REDIRECT=$redirect" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "::notice title=GCRD Input Normalized::Code captured. Redirect URL set to: $redirect"
 
       - name: 🧩 Install Chrome Remote Desktop Host
         shell: pwsh
         run: |
           $url = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
-          $msi = Join-Path $env:TEMP "crdhost.msi"
+          $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
           Write-Host "🌐 Downloading Chrome Remote Desktop Host MSI..."
           Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
           Write-Host "🛠️  Installing (silent)..."
@@ -81,26 +110,34 @@ jobs:
           }
           Write-Host "✅ Chrome Remote Desktop Host installed."
 
-      - name: 🔗 Register Host via GCRD (exact SSH command)
+      - name: 🧭 Resolve CRD executable path
+        shell: pwsh
+        run: |
+          $x86 = Join-Path ${env:ProgramFiles(x86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          $x64 = Join-Path ${env:ProgramFiles} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          $exe = $null
+          if (Test-Path $x86) { $exe = $x86 }
+          elseif (Test-Path $x64) { $exe = $x64 }
+          else { Write-Error "❌ remoting_start_host.exe not found after installation."; exit 1 }
+
+          "`nCRD_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "::notice title=GCRD Path::Using '$exe'"
+
+      - name: 🔗 Register Host via Chrome Remote Desktop (headless)
         shell: cmd
         run: |
-          if NOT "%GCRD_PIN%"=="" (
-            "%PROGRAMFILES(X86)%\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" --code="%GCRD_CODE%" --redirect-url="%GCRD_REDIRECT_URL%" --name=%COMPUTERNAME% --pin=%GCRD_PIN%
+          IF NOT "%GCRD_PIN%"=="" (
+            "%CRD_EXE%" --code="%GCRD_CODE%" --redirect-url="%GCRD_REDIRECT%" --name=%COMPUTERNAME% --pin=%GCRD_PIN%
           ) ELSE (
-            "%PROGRAMFILES(X86)%\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" --code="%GCRD_CODE%" --redirect-url="%GCRD_REDIRECT_URL%" --name=%COMPUTERNAME%
+            "%CRD_EXE%" --code="%GCRD_CODE%" --redirect-url="%GCRD_REDIRECT%" --name=%COMPUTERNAME%
           )
 
       - name: 📣 GCRD Status
         shell: pwsh
         run: |
-          $exe = Join-Path ${env:ProgramFiles(x86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          if (Test-Path $exe) {
-            Write-Host "::notice title=GCRD::Registered host '$env:COMPUTERNAME' via Chrome Remote Desktop."
-          } else {
-            Write-Host "::warning title=GCRD::remoting_start_host.exe not found after registration."
-          }
+          Write-Host "::notice title=GCRD::Host '%env:COMPUTERNAME%' registered. You can now connect via remotedesktop.google.com."
 
-      - name: 📥 Fetch EnigMano-Instance.ps1 (from GitLab base)
+      - name: 📥 Fetch EnigMano-Instance.ps1 (GitLab / win10)
         shell: pwsh
         run: |
           $url = "https://gitlab.com/Shahzaib-YT/enigmano-win10-with-sound/-/raw/main/EnigMano-Instance.ps1"
