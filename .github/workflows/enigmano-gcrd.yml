@@ -12,7 +12,7 @@ on:
         required: true
         default: ""
       GCRD_PIN:
-        description: "PIN (≥6 digits). Leave blank to use the word 'EnigMano' (auto-converted to digits)"
+        description: "PIN (≥6 digits). Leave blank to use digits derived from 'EnigMano'"
         required: false
         default: ""
       USERNAME:
@@ -51,10 +51,10 @@ jobs:
 
     steps:
       # 1) Warm-up + Normalize (writes env vars for later steps)
-      - name: ✨ Warm-Up (50s) & Normalize
+      - name: "✨ Warm-Up (50s) & Normalize"
         shell: pwsh
         run: |
-          # Warm-up
+          # Warm-up first so services settle
           Write-Host "🕒 Warming up runner for 50 seconds..."
           Start-Sleep -Seconds 50
 
@@ -70,7 +70,7 @@ jobs:
 
           function Fail($m){ Write-Error $m; exit 1 }
 
-          # Parse OAuth code: accept full command or just the code
+          # Parse OAuth code (full command or just code)
           $raw = $env:SSH_CODE_OR_CMD
           if (-not $raw) { Fail "❌ Missing SSH_CODE_OR_CMD." }
           $code = $null
@@ -88,7 +88,7 @@ jobs:
           if (-not $redirect) { $redirect = "https://remotedesktop.google.com/_/oauthredirect" }
           if ($raw -match '--redirect-url="([^"]+)"') { $redirect = $Matches[1] }
 
-          # PIN logic: numeric input or derived from "EnigMano"
+          # PIN: numeric input (≥6) or derived from "EnigMano"
           function Convert-ToT9($text){
             $map = @{
               'A'=2;'B'=2;'C'=2; 'D'=3;'E'=3;'F'=3; 'G'=4;'H'=4;'I'=4;
@@ -121,15 +121,15 @@ jobs:
           "TARGET_USER=$user"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_PASS=$pass"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Mask sensitive things in logs
+          # Mask sensitive
           Write-Host "::add-mask::$code"
           Write-Host "::add-mask::$pass"
           Write-Host "::add-mask::$pin"
 
           Write-Host "::notice title=Normalized::User=$user | Redirect=$redirect | PIN source=$pinSrc"
 
-      # 2) ONE STEP: Ensure admin → Install CRD → Register with elevated Scheduled Task using a short wrapper
-      - name: 🔐 Install & Register Chrome Remote Desktop (one-step)
+      # 2) ONE STEP: Ensure admin → Install CRD → Register via elevated Scheduled Task (wrapper) → Verify
+      - name: "🔐 Install & Register Chrome Remote Desktop (one-step)"
         shell: pwsh
         run: |
           function Fail($m){ Write-Error $m; exit 1 }
@@ -196,11 +196,11 @@ jobs:
           }
           if ($ok) { Write-Host "✅ CRD host appears registered (host file present)." } else { Write-Host "::warning title=CRD::Host files not detected yet; check remotedesktop.google.com/access." }
 
-          # Clean up task (wrapper kept for re-run if desired)
+          # Clean up task (keep wrapper for manual re-run if desired)
           schtasks /Delete /F /TN $task | Out-Null
 
       # 3) Download your EnigMano script from GitLab
-      - name: 📥 Fetch EnigMano-Instance.ps1
+      - name: "📥 Fetch EnigMano-Instance.ps1"
         shell: pwsh
         run: |
           $url = "https://gitlab.com/Shahzaib-YT/enigmano-win10-with-sound/-/raw/main/EnigMano-Instance.ps1"
@@ -213,14 +213,14 @@ jobs:
           Write-Host "✅ EnigMano-Instance.ps1 downloaded."
 
       # 4) Always run PS1 after GCRD setup
-      - name: ⚔️ Execute EnigMano-Instance.ps1
+      - name: "⚔️ Execute EnigMano-Instance.ps1"
         shell: pwsh
         run: |
           Write-Host "🚦 Initiating EnigMano-Instance.ps1"
           powershell.exe -ExecutionPolicy Bypass -File ".\EnigMano-Instance.ps1"
 
       # 5) Final Summary (show username, password, PIN)
-      - name: 🧾 Connection Summary
+      - name: "🧾 Connection Summary"
         shell: pwsh
         run: |
           $user = $env:TARGET_USER
