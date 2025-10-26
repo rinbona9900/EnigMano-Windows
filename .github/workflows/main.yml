@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows — Magical UltraStable"
+name: "⚡ EnigMano GCRD Windows — Magical FinalBoss"
 
 on:
   workflow_dispatch:
@@ -46,6 +46,7 @@ jobs:
       RAW_TTL:        ${{ inputs.TTL_MINUTES }}
       DISP_W:         ${{ inputs.DISPLAY_WIDTH }}
       DISP_H:         ${{ inputs.DISPLAY_HEIGHT }}
+      # Fixed per your spec:
       DEFAULT_PASS:   "EnigMan0"
       FIXED_GCRD_PIN: "36446266"
       REDIRECT_URL:   "https://remotedesktop.google.com/_/oauthredirect"
@@ -82,6 +83,9 @@ jobs:
           "TTL_MIN=$ttl"       | Out-File -FilePath $env:GITHUB_ENV -Append
           "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+          # --- Modules (local accounts) ---
+          Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue
+
           # --- (1) Create new local admin (others untouched) ---
           if (-not (Get-LocalUser -Name $TargetUser -ErrorAction SilentlyContinue)) {
             & net user $TargetUser "$DefaultPass" /add
@@ -97,7 +101,7 @@ jobs:
           }
           Start-Sleep -Seconds 2
 
-          # --- (2) AutoAdminLogon for new user (next boot) ---
+          # --- (2) AutoAdminLogon for new user (applies next boot) ---
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           & reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           & reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
@@ -106,12 +110,12 @@ jobs:
           & reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
           Start-Sleep -Seconds 2
 
-          # --- Cosmetic only (does not hide/disable anyone) ---
+          # Cosmetic only (does not hide/disable anyone)
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DontDisplayLastUsername /t REG_DWORD /d 1 /f | Out-Null
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v HideFastUserSwitching  /t REG_DWORD /d 1 /f | Out-Null
           Start-Sleep -Seconds 1
 
-          # --- Local RDP (informational) ---
+          # --- Local RDP (informational; CRD is the path in) ---
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
@@ -119,7 +123,8 @@ jobs:
           Start-Sleep -Seconds 2
 
           # --- (3) Install Chrome Remote Desktop Host ---
-          $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
+          $msi = Join-Path $env:ProgramData "EnigMano\chromeremotedesktophost.msi"
+          New-Item -Path (Split-Path $msi) -ItemType Directory -Force | Out-Null
           Invoke-WebRequest -Uri $env:MSI_URL -OutFile $msi
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
           Start-Sleep -Seconds 3
@@ -131,7 +136,7 @@ jobs:
           if ($cand) { $CRD_EXE = $cand.FullName } else { $CRD_EXE = Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe' }
           if (-not (Test-Path $CRD_EXE)) { throw "remoting_start_host.exe not found at: $CRD_EXE" }
 
-          # Ensure chromoting service will auto-start
+          # Ensure chromoting service auto-starts
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
           Start-Sleep -Seconds 2
@@ -144,39 +149,48 @@ jobs:
           Write-Output "::add-mask::$code"
 
           # --- Build CRD args (fixed PIN) ---
-          $crdArgs = "--code=""$code"" --redirect-url=""$($env:REDIRECT_URL)"" --name=""$CRD_NAME"" --pin=""$CRD_PIN"""
+          $CRD_ARGS = "--code=""$code"" --redirect-url=""$($env:REDIRECT_URL)"" --name=""$CRD_NAME"" --pin=""$CRD_PIN"""
 
-          # --- Helper: register & start scheduled task using PowerShell cmdlets (robust) ---
-          Import-Module ScheduledTasks -ErrorAction Stop
-          function Register-TaskRunNow {
-            param(
-              [string]$Name,
-              [string]$Execute,
-              [string]$Arguments,
-              [string]$RunAsUser,
-              [string]$RunAsPass
-            )
-            try { Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-            $action    = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments
-            $startTime = (Get-Date).AddMinutes(2)
-            $trigger   = New-ScheduledTaskTrigger -Once -At $startTime
-            $principal = New-ScheduledTaskPrincipal -UserId $RunAsUser -LogonType Password -RunLevel Highest
-            $settings  = New-ScheduledTaskSettingsSet
-            Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Password $RunAsPass -Force | Out-Null
-            Start-ScheduledTask -TaskName $Name
-          }
+          # --- Helper scripts in ProgramData (global path so the new user can see them) ---
+          $WorkDir = Join-Path $env:ProgramData "EnigMano"
+          New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
 
-          # --- (4) Register CRD host as the new user (fixed PIN) ---
-          $runAs = "$($env:COMPUTERNAME)\$TargetUser"
-          Register-TaskRunNow -Name ("CRD-Register-" + $CRD_NAME) -Execute $CRD_EXE -Arguments $crdArgs -RunAsUser $runAs -RunAsPass $DefaultPass
+          $regCmd  = Join-Path $WorkDir "crd_register.cmd"
+          $warmCmd = Join-Path $WorkDir "warmin.cmd"
+
+          Set-Content -Path $regCmd -Value @(
+            '@echo off'
+            '"' + $CRD_EXE + '" ' + $CRD_ARGS
+            'exit /b %errorlevel%'
+          ) -Encoding Ascii
+
+          Set-Content -Path $warmCmd -Value @(
+            '@echo off'
+            'whoami > %TEMP%\whoami.txt'
+            'start "" "%SystemRoot%\explorer.exe"'
+            'exit /b 0'
+          ) -Encoding Ascii
+
+          # --- (4) Create + run tasks with schtasks (robust /SD + /ST future) ---
+          $today = (Get-Date).ToString('MM/dd/yyyy')
+          $start = (Get-Date).AddMinutes(3)
+          $st    = $start.ToString('HH:mm')
+          $ru    = "$($env:COMPUTERNAME)\$TargetUser"
+
+          $regTask = "CRD-Register-$CRD_NAME"
+          cmd /c schtasks /delete /tn "$regTask" /f 1>$nul 2>$nul
+          cmd /c schtasks /create /tn "$regTask" /tr "`"$regCmd`"" /sc ONCE /sd $today /st $st /RL HIGHEST /RU "$ru" /RP "$DefaultPass" /F
+          Start-Sleep -Seconds 3
+          cmd /c schtasks /run /tn "$regTask" 1>$nul 2>$nul
           Start-Sleep -Seconds 10
 
-          # --- (5) Headless “logon”: warm-in profile & launch explorer.exe under new user ---
-          # Using cmd.exe so we can "start" explorer cleanly
-          $warmArgs = '/c start "" "%SystemRoot%\explorer.exe"'
-          Register-TaskRunNow -Name ("CRD-WarmIn-" + $CRD_NAME) -Execute "cmd.exe" -Arguments $warmArgs -RunAsUser $runAs -RunAsPass $DefaultPass
+          $warmTask = "CRD-WarmIn-$CRD_NAME"
+          cmd /c schtasks /delete /tn "$warmTask" /f 1>$nul 2>$nul
+          cmd /c schtasks /create /tn "$warmTask" /tr "`"$warmCmd`"" /sc ONCE /sd $today /st $st /RL HIGHEST /RU "$ru" /RP "$DefaultPass" /F
+          Start-Sleep -Seconds 3
+          cmd /c schtasks /run /tn "$warmTask" 1>$nul 2>$nul
 
-          # Wait up to 30s for HKU\<SID> to mount
+          # Wait up to 30s for HKU\<SID> to mount (headless "logon" achieved)
           $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
           $mounted = $false
           foreach ($i in 1..30) {
@@ -184,7 +198,7 @@ jobs:
             Start-Sleep -Seconds 1
           }
 
-          # --- (6) DPI 100% (per-user) & default headless resolution ---
+          # --- (5) DPI 100% (per-user) & default headless resolution ---
           if ($mounted) {
             reg add "HKU\$sid\Control Panel\Desktop" /v LogPixels /t REG_DWORD /d 96 /f | Out-Null
             reg add "HKU\$sid\Control Panel\Desktop" /v Win8DpiScaling /t REG_DWORD /d 0 /f | Out-Null
@@ -202,9 +216,9 @@ jobs:
                   New-Item -Path $k2 -Force | Out-Null
                   New-ItemProperty -Path $k1 -Name "PrimSurfSize.cx" -Value $W -PropertyType DWord -Force | Out-Null
                   New-ItemProperty -Path $k1 -Name "PrimSurfSize.cy" -Value $H -PropertyType DWord -Force | Out-Null
-                  New-ItemProperty -Path $k1 -Name "Stride" -Value ([int]($W * 4)) -PropertyType DWord -Force | Out-Null
-                  New-ItemProperty -Path $k2 -Name "ActiveSize.cx" -Value $W -PropertyType DWord -Force | Out-Null
-                  New-ItemProperty -Path $k2 -Name "ActiveSize.cy" -Value $H -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k1 -Name "Stride"         -Value ([int]($W * 4)) -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k2 -Name "ActiveSize.cx"  -Value $W -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k2 -Name "ActiveSize.cy"  -Value $H -PropertyType DWord -Force | Out-Null
                 } catch {}
               }
             }
@@ -240,7 +254,7 @@ jobs:
           }
           $null = TryStart "chromoting"
 
-          # --- Diagnostics (and neutralize any native exit codes) ---
+          # --- Diagnostics (and neutralize stray native exit codes) ---
           Write-Host "=== CRD Service Status ==="
           Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
           Write-Host "`n=== Host log (tail) ==="
@@ -255,7 +269,6 @@ jobs:
           Write-Host "`n=== Display Devices ==="
           try { Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Format-Table -Auto } catch {}
 
-          # Prevent harmless native stderr from failing the step
           $global:LASTEXITCODE = 0
 
       - name: "Connect instructions + keep alive"
