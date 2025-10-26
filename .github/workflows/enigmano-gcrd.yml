@@ -27,10 +27,6 @@ on:
         description: "Redirect URL (leave default unless Google changes it)"
         required: false
         default: "https://remotedesktop.google.com/_/oauthredirect"
-      RUN_ENIGMANO_PS1_AFTER:
-        description: "Run EnigMano-Instance.ps1 after CRD setup? (yes/no)"
-        required: false
-        default: "yes"
 
 jobs:
   deploy-enigmano:
@@ -52,12 +48,16 @@ jobs:
       USERNAME_INPUT: ${{ github.event.inputs.USERNAME }}
       PASSWORD_INPUT: ${{ github.event.inputs.PASSWORD }}
       GCRD_REDIRECT_URL_INPUT: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
-      RUN_ENIGMANO_PS1_AFTER_INPUT: ${{ github.event.inputs.RUN_ENIGMANO_PS1_AFTER }}
 
     steps:
-      - name: ✨ Banner
+      # 1) Warm-up (wait 50s) + Normalize inputs + Defaults
+      - name: ✨ Warm-Up (50s) & Normalize
         shell: pwsh
         run: |
+          # --- Warm-up: ensure runner services are fully up before GCRD ---
+          Write-Host "🕒 Warming up runner for 50 seconds..."
+          Start-Sleep -Seconds 50
+
           Write-Host @"
           ----------------------------------------------------
                    ENIGMANO GCRD BOOTSTRAP INITIALIZING
@@ -68,45 +68,27 @@ jobs:
           ----------------------------------------------------
           "@
 
-      - name: 📌 Echo Parameters (safe)
-        shell: pwsh
-        run: |
-          Write-Host "==============================================="
-          Write-Host "📦 Repo               : $env:REPO"
-          Write-Host "🆔 Deployment ID      : $env:DEPLOYMENT_ID"
-          Write-Host "🖥️  Instance ID        : $env:INSTANCE_ID"
-          Write-Host "👤 User (requested)    : " + ($(if($env:USERNAME_INPUT){$env:USERNAME_INPUT}else{"runneradmin"}))
-          Write-Host "🔗 Redirect URL       : $env:GCRD_REDIRECT_URL_INPUT"
-          Write-Host "🔑 PIN Provided?      : " ($env:GCRD_PIN_INPUT -ne "" )
-          Write-Host "▶️  Run PS1 After?      : $env:RUN_ENIGMANO_PS1_AFTER_INPUT"
-          Write-Host "==============================================="
-
-      - name: 🧪 Normalize inputs (OAuth code, redirect, PIN, user) + set flags
-        shell: pwsh
-        run: |
           function Fail($m){ Write-Error $m; exit 1 }
 
-          # --- OAuth code: accept full command or just code ---
+          # Parse OAuth code: accept full command or just code
           $raw = $env:SSH_CODE_OR_CMD
           if (-not $raw) { Fail "❌ Missing SSH_CODE_OR_CMD." }
-
           $code = $null
           if ($raw -match '--code="([^"]+)"') {
             $code = $Matches[1]
           } elseif ($raw -match '^\s*"%PROGRAMFILES\(X86\)%\\Google\\Chrome Remote Desktop\\CurrentVersion\\remoting_start_host\.exe"') {
-            Fail "❌ Could not parse --code from the provided command. Paste the full command again or just the code."
+            Fail "❌ Could not parse --code from the provided command. Paste full command again or just the code."
           } else {
             $code = $raw.Trim()
           }
           if (-not $code) { Fail "❌ Empty OAuth code after parsing." }
 
-          # --- Redirect URL ---
+          # Redirect (prefer provided, else from cmd, else default)
           $redirect = $env:GCRD_REDIRECT_URL_INPUT
           if (-not $redirect) { $redirect = "https://remotedesktop.google.com/_/oauthredirect" }
           if ($raw -match '--redirect-url="([^"]+)"') { $redirect = $Matches[1] }
 
-          # --- PIN logic ---
-          $userPin = $env:GCRD_PIN_INPUT
+          # PIN: if numeric ≥6 use it; else map "EnigMano" to T9 digits
           function Convert-ToT9($text){
             $map = @{
               'A'=2;'B'=2;'C'=2; 'D'=3;'E'=3;'F'=3; 'G'=4;'H'=4;'I'=4;
@@ -118,168 +100,95 @@ jobs:
               elseif ($_ -match '\d') { $_ }
             }) -join ''
           }
+          $userPin = $env:GCRD_PIN_INPUT
           if ($userPin -and ($userPin -match '^\d{6,}$')) {
             $pin = $userPin
-            $pinSource = "input"
+            $pinSrc = "input"
           } else {
             $t9 = Convert-ToT9 "EnigMano"   # -> 3644266
-            if ($t9 -and $t9.Length -ge 6) {
-              $pin = $t9
-              $pinSource = "derived-from-EnigMano"
-            } else {
-              $pin = "919191"
-              $pinSource = "fallback"
-            }
+            $pin = if ($t9 -and $t9.Length -ge 6) { $t9 } else { "919191" }
+            $pinSrc = "derived"
           }
 
-          # --- User defaults ---
+          # Admin user defaults
           $user = if ($env:USERNAME_INPUT) { $env:USERNAME_INPUT } else { "runneradmin" }
           $pass = if ($env:PASSWORD_INPUT) { $env:PASSWORD_INPUT } else { "P@ssw0rd!" }
 
-          # --- Whether to run PS1 afterward ---
-          $runStr = ($env:RUN_ENIGMANO_PS1_AFTER_INPUT + "").ToLower()
-          $runPs1 = if ($runStr -match '^(y|yes|true|1)$') { 'true' } else { 'false' }
-
-          # Export normalized values & flag
+          # Export to job env
           "GCRD_CODE=$code"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GCRD_REDIRECT=$redirect" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GCRD_PIN=$pin"           | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_USER=$user"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_PASS=$pass"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "RUN_PS1=$runPs1"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Mask secrets
+          # Mask sensitive
           Write-Host "::add-mask::$code"
           Write-Host "::add-mask::$pass"
           Write-Host "::add-mask::$pin"
 
-          Write-Host "::notice title=GCRD Normalized::Code captured. Redirect: $redirect. PIN source: $pinSource. User: $user. Run PS1: $runPs1"
+          Write-Host "::notice title=Normalized::User=$user | Redirect=$redirect | PIN source=$pinSrc"
 
-      - name: 👤 Ensure local admin exists & is enabled
-        shell: pwsh
-        run: |
-          function Ensure-LocalAdmin($u,$p){
-            $secure = ConvertTo-SecureString $p -AsPlainText -Force
-            $exists = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
-            if ($exists) {
-              Set-LocalUser -Name $u -Password $secure
-              Write-Host "🔐 Reset password for existing user '$u'."
-            } else {
-              New-LocalUser -Name $u -Password $secure -FullName $u -Description "EnigMano Admin"
-              Write-Host "👤 Created local user '$u'."
-            }
-            try { Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue } catch {}
-            & net user $u /active:yes | Out-Null
-            Write-Host "🛡️  '$u' ensured as local administrator and set active."
-          }
-          Ensure-LocalAdmin -u $env:TARGET_USER -p $env:TARGET_PASS
-
-      - name: 🧩 Install Chrome Remote Desktop Host (retry)
+      # 2) ONE-STEP: Ensure admin → Install CRD → Register via elevated Scheduled Task → Verify
+      - name: 🔐 Install & Register Chrome Remote Desktop (one-step)
         shell: pwsh
         run: |
           function Fail($m){ Write-Error $m; exit 1 }
+
+          # Ensure local admin (create or update)
+          $secure = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
+          $exists = Get-LocalUser -Name $env:TARGET_USER -ErrorAction SilentlyContinue
+          if ($exists) {
+            Set-LocalUser -Name $env:TARGET_USER -Password $secure
+            Write-Host "🔐 Reset password for existing '$($env:TARGET_USER)'."
+          } else {
+            New-LocalUser -Name $env:TARGET_USER -Password $secure -FullName $env:TARGET_USER -Description "EnigMano Admin"
+            Write-Host "👤 Created local user '$($env:TARGET_USER)'."
+          }
+          try { Add-LocalGroupMember -Group "Administrators" -Member $env:TARGET_USER -ErrorAction SilentlyContinue } catch {}
+          & net user $env:TARGET_USER /active:yes | Out-Null
+          Write-Host "🛡️  '$($env:TARGET_USER)' ensured as local administrator and active."
+
+          # Install CRD
           $url = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
-          for ($i=1; $i -le 3; $i++) {
-            try {
-              Write-Host "🌐 Download attempt $i ..."
-              Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
-              if (Test-Path $msi) { break }
-            } catch {
-              if ($i -eq 3) { Fail "❌ Failed to download CRD MSI after 3 attempts: $_" }
-              Start-Sleep -Seconds (5*$i)
-            }
-          }
-          Write-Host "🛠️  Installing (silent)..."
-          $args = "/i `"$msi`" /qn /norestart"
-          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Fail "❌ CRD Host install failed with exit code $($p.ExitCode)" }
-          Write-Host "✅ Chrome Remote Desktop Host installed."
+          Write-Host "🌐 Downloading CRD MSI..."
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+          Write-Host "🛠️  Installing CRD (silent)..."
+          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Fail "❌ CRD install failed with exit code $($p.ExitCode)" }
+          Write-Host "✅ CRD installed."
 
-      - name: 🧭 Resolve CRD executable path
-        shell: pwsh
-        run: |
-          function Fail($m){ Write-Error $m; exit 1 }
+          # Resolve CRD exe path
           $x86 = Join-Path ${env:ProgramFiles(x86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           $x64 = Join-Path ${env:ProgramFiles} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          $exe = $null
-          if (Test-Path $x86) { $exe = $x86 }
-          elseif (Test-Path $x64) { $exe = $x64 }
-          else { Fail "❌ remoting_start_host.exe not found after installation." }
-          "CRD_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "::notice title=GCRD Path::Using '$exe'"
+          $exe = if (Test-Path $x86) { $x86 } elseif (Test-Path $x64) { $x64 } else { "" }
+          if (-not $exe) { Fail "❌ remoting_start_host.exe not found." }
+          Write-Host "::notice title=CRD Path::Using '$exe'"
 
-      - name: 🔐 Register CRD host under the target admin user (headless)
-        shell: pwsh
-        run: |
-          $sec = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ($env:TARGET_USER, $sec)
-          $args = @(
-            "--code=""$env:GCRD_CODE"""
-            "--redirect-url=""$env:GCRD_REDIRECT"""
-            "--name=""$env:COMPUTERNAME"""
-            "--pin=""$env:GCRD_PIN"""
-          ) -join ' '
-          Write-Host "➡️  Running CRD registration as '$($env:TARGET_USER)' ..."
-          $proc = Start-Process -FilePath $env:CRD_EXE -ArgumentList $args -Credential $cred -PassThru -WindowStyle Hidden
-          $proc.WaitForExit()
-          Write-Host "📨 remoting_start_host.exe exited with code: $($proc.ExitCode)"
+          # Register via elevated Scheduled Task (runs as chosen admin)
+          $task = "EnigManoCRDRegister"
+          $tr   = "`"$exe`" --code=`"$($env:GCRD_CODE)`" --redirect-url=`"$($env:GCRD_REDIRECT)`" --name=$($env:COMPUTERNAME) --pin=$($env:GCRD_PIN)"
+          schtasks /Create /F /RL HIGHEST /SC ONCE /ST 23:59 /TN $task /TR "$tr" /RU "$($env:TARGET_USER)" /RP "$($env:TARGET_PASS)" | Out-Null
+          schtasks /Run /TN $task | Out-Null
+          Write-Host "🚀 CRD registration task launched as '$($env:TARGET_USER)'."
 
-      - name: 🩺 Verify CRD (service/process/host json)
-        shell: pwsh
-        run: |
-          function Try-GetService([string[]]$names){
-            foreach($n in $names){
-              $s = Get-Service -Name $n -ErrorAction SilentlyContinue
-              if ($s){ return $s }
-            }
-            return $null
+          # Wait for completion & check host files / processes (up to ~2 minutes)
+          $ok = $false
+          for ($i=1; $i -le 24; $i++) {
+            Start-Sleep -Seconds 5
+            $hostPaths = @(
+              "C:\ProgramData\Google\Chrome Remote Desktop\host.json",
+              "C:\ProgramData\Google\Chrome Remote Desktop\host_unprivileged.json"
+            ) | Where-Object { Test-Path $_ }
+            if ($hostPaths.Count -gt 0) { $ok = $true; break }
           }
+          if ($ok) { Write-Host "✅ CRD host appears registered (host file present)." } else { Write-Host "::warning title=CRD::Host files not detected yet; check remotedesktop.google.com/access." }
 
-          $svc = Try-GetService @("ChromeRemoteDesktopService","chromeremotedesktopservice")
-          if ($svc) {
-            Write-Host "::notice title=CRD Service::State = $($svc.Status)"
-            if ($svc.Status -ne "Running") { try { Start-Service $svc.Name } catch {} }
-          } else {
-            Write-Host "::warning title=CRD Service::Service not listed (per-user mode expected)."
-          }
+          # Clean up task
+          schtasks /Delete /F /TN $task | Out-Null
 
-          $hostJsons = @(
-            "C:\ProgramData\Google\Chrome Remote Desktop\host.json",
-            "C:\ProgramData\Google\Chrome Remote Desktop\host_unprivileged.json"
-          ) | Where-Object { Test-Path $_ }
-
-          if ($hostJsons.Count -gt 0) {
-            Write-Host "::notice title=CRD Host Files::Found -> $($hostJsons -join ', ')"
-          } else {
-            Write-Host "::warning title=CRD Host Files::Not found yet (may be per-user)."
-          }
-
-          $proc = Get-Process -Name "remoting_host","remote_assistance_host" -ErrorAction SilentlyContinue
-          if ($proc) {
-            Write-Host "::notice title=CRD Process::$(($proc | Select-Object -ExpandProperty ProcessName) -join ', ')"
-          } else {
-            Write-Host "::warning title=CRD Process::Not visible in system session (may still be active under user session)."
-          }
-
-      - name: 🧾 Connection Summary
-        shell: pwsh
-        run: |
-          $pin = $env:GCRD_PIN
-          $tail = if ($pin.Length -ge 2) { $pin.Substring($pin.Length-2) } else { $pin }
-          $pinMasked = ('*' * [Math]::Max(0,$pin.Length-2)) + $tail
-          @"
-          ## ✅ EnigMano GCRD is Ready
-
-          - **Computer Name**: $env:COMPUTERNAME
-          - **User Context** : $env:TARGET_USER (local admin; active)
-          - **Access**       : https://remotedesktop.google.com/access
-          - **PIN**          : (masked) $pinMasked
-          - **Note**         : If you left PIN blank, the word 'EnigMano' was auto-converted to digits to satisfy GCRD.
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-      - name: 📥 Fetch EnigMano-Instance.ps1 (GitLab / win10)
-        if: env.RUN_PS1 == 'true'
+      # 3) Download your EnigMano script from GitLab
+      - name: 📥 Fetch EnigMano-Instance.ps1
         shell: pwsh
         run: |
           $url = "https://gitlab.com/Shahzaib-YT/enigmano-win10-with-sound/-/raw/main/EnigMano-Instance.ps1"
@@ -291,17 +200,30 @@ jobs:
           }
           Write-Host "✅ EnigMano-Instance.ps1 downloaded."
 
+      # 4) Always run PS1 after GCRD setup
       - name: ⚔️ Execute EnigMano-Instance.ps1
-        if: env.RUN_PS1 == 'true'
         shell: pwsh
         run: |
           Write-Host "🚦 Initiating EnigMano-Instance.ps1"
           powershell.exe -ExecutionPolicy Bypass -File ".\EnigMano-Instance.ps1"
 
-      - name: 🏁 Finish
-        if: always()
+      # 5) Final Summary (show username, password, PIN)
+      - name: 🧾 Connection Summary
         shell: pwsh
         run: |
-          Write-Host "✅ EnigMano GCRD bootstrap completed for Instance $env:INSTANCE_ID."
-          Write-Host "🔋 Powered by: SHAHZAIB-YT"
-          Write-Host "🏁 Remote access should now be available via Chrome Remote Desktop."
+          $user = $env:TARGET_USER
+          $pass = $env:TARGET_PASS
+          $pin  = $env:GCRD_PIN
+          @"
+          ## ✅ EnigMano Completed
+
+          - **Computer Name** : $env:COMPUTERNAME
+          - **User Context**  : $user
+          - **Password**      : $pass
+          - **CRD Access**    : https://remotedesktop.google.com/access
+          - **CRD PIN**       : $pin
+
+          > NOTE: You asked to show credentials. Rotate if needed.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          Write-Host "::notice title=Credentials::User=$user | Pass=$pass | PIN=$pin"
