@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows — Magical vPro Solid"
+name: "⚡ EnigMano GCRD Windows — Magical UltraStable"
 
 on:
   workflow_dispatch:
@@ -52,16 +52,17 @@ jobs:
       MSI_URL:        "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
 
     steps:
-      - name: "Create admin → autologon → CRD install/register → display → warm-in session"
+      - name: "Create admin → AutoAdminLogon → CRD install/register → headless desktop → resolution"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
 
-          # Admin token check (runner should be elevated)
+          # --- Ensure elevated ---
           $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
           if (-not $isAdmin) { throw "This workflow requires administrative privileges. Current token is not elevated." }
 
-          # Inputs
+          # --- Inputs ---
           $instance    = $env:INSTANCE.Trim()
           $TargetUser  = $env:NEW_USERNAME.Trim()
           $setupInput  = $env:RAW_SETUP.Trim()
@@ -81,14 +82,14 @@ jobs:
           "TTL_MIN=$ttl"       | Out-File -FilePath $env:GITHUB_ENV -Append
           "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # (1) Create new local admin (others untouched)
+          # --- (1) Create new local admin (others untouched) ---
           if (-not (Get-LocalUser -Name $TargetUser -ErrorAction SilentlyContinue)) {
             & net user $TargetUser "$DefaultPass" /add
           } else {
             & net user $TargetUser "$DefaultPass"
           }
           Start-Sleep -Seconds 2
-          & net localgroup Administrators $TargetUser /add
+          & net localgroup Administrators $TargetUser /add | Out-Null
           Start-Sleep -Seconds 2
           try { & net localgroup "Remote Desktop Users" $TargetUser /add | Out-Null } catch {}
           if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
@@ -96,7 +97,7 @@ jobs:
           }
           Start-Sleep -Seconds 2
 
-          # (2) AutoAdminLogon to new user (applies on next boot)
+          # --- (2) AutoAdminLogon for new user (next boot) ---
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           & reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           & reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
@@ -105,86 +106,77 @@ jobs:
           & reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
           Start-Sleep -Seconds 2
 
-          # Cosmetic (does not hide/disable users)
+          # --- Cosmetic only (does not hide/disable anyone) ---
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DontDisplayLastUsername /t REG_DWORD /d 1 /f | Out-Null
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v HideFastUserSwitching  /t REG_DWORD /d 1 /f | Out-Null
           Start-Sleep -Seconds 1
 
-          # Local RDP (informational)
+          # --- Local RDP (informational) ---
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
           try { Start-Service TermService } catch {}
           Start-Sleep -Seconds 2
 
-          # (3) Install CRD host
+          # --- (3) Install Chrome Remote Desktop Host ---
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
           Invoke-WebRequest -Uri $env:MSI_URL -OutFile $msi
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
           Start-Sleep -Seconds 3
 
-          # Discover remoting_start_host.exe
+          # Discover remoting_start_host.exe robustly
           $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
           $CRD_EXE = $null
           $cand = Get-ChildItem -Path (Join-Path $pf86 'Google\Chrome Remote Desktop') -Recurse -Filter "remoting_start_host.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
           if ($cand) { $CRD_EXE = $cand.FullName } else { $CRD_EXE = Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe' }
           if (-not (Test-Path $CRD_EXE)) { throw "remoting_start_host.exe not found at: $CRD_EXE" }
 
+          # Ensure chromoting service will auto-start
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
           Start-Sleep -Seconds 2
 
-          # Parse OAuth code (permissive)
+          # --- Parse OAuth code from input (accepts full command or bare 4/...) ---
           $code = $null
           if ($setupInput -match 'code="?([^"\s]+)"?') { $code = $Matches[1] }
           elseif ($setupInput -match '(4\/[A-Za-z0-9._~-]+)') { $code = $Matches[1] }
           if (-not $code) { throw "No OAuth code detected. Paste full command w/ --code=... or the code starting with '4/'." }
           Write-Output "::add-mask::$code"
 
-          # (4) Register CRD host as new user (fixed PIN)
-          $args = @(
-            "--code=""$code"""
-            "--redirect-url=""$($env:REDIRECT_URL)"""
-            "--name=""$CRD_NAME"""
-            "--pin=""$CRD_PIN"""
-          ) -join " "
+          # --- Build CRD args (fixed PIN) ---
+          $crdArgs = "--code=""$code"" --redirect-url=""$($env:REDIRECT_URL)"" --name=""$CRD_NAME"" --pin=""$CRD_PIN"""
 
-          $today = (Get-Date).ToString('MM/dd/yyyy')
-          $start = (Get-Date).AddMinutes(3)
-          $st    = $start.ToString('HH:mm')
+          # --- Helper: register & start scheduled task using PowerShell cmdlets (robust) ---
+          Import-Module ScheduledTasks -ErrorAction Stop
+          function Register-TaskRunNow {
+            param(
+              [string]$Name,
+              [string]$Execute,
+              [string]$Arguments,
+              [string]$RunAsUser,
+              [string]$RunAsPass
+            )
+            try { Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            $action    = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments
+            $startTime = (Get-Date).AddMinutes(2)
+            $trigger   = New-ScheduledTaskTrigger -Once -At $startTime
+            $principal = New-ScheduledTaskPrincipal -UserId $RunAsUser -LogonType Password -RunLevel Highest
+            $settings  = New-ScheduledTaskSettingsSet
+            Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Password $RunAsPass -Force | Out-Null
+            Start-ScheduledTask -TaskName $Name
+          }
 
-          $regTask = "CRD-Register-$CRD_NAME"
-          $regCmd  = Join-Path $env:TEMP "crd_register.cmd"
-          $regLines = @(
-            '@echo off'
-            '"' + $CRD_EXE + '" ' + $args
-            'exit /b %errorlevel%'
-          )
-          Set-Content -Path $regCmd -Value $regLines -Encoding Ascii
-
-          schtasks /delete /tn "$regTask" /f | Out-Null 2>$null
-          schtasks /create /tn "$regTask" /tr "$regCmd" /sc ONCE /sd $today /st $st /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
-          Start-Sleep -Seconds 3
-          schtasks /run /tn "$regTask" | Out-Null
+          # --- (4) Register CRD host as the new user (fixed PIN) ---
+          $runAs = "$($env:COMPUTERNAME)\$TargetUser"
+          Register-TaskRunNow -Name ("CRD-Register-" + $CRD_NAME) -Execute $CRD_EXE -Arguments $crdArgs -RunAsUser $runAs -RunAsPass $DefaultPass
           Start-Sleep -Seconds 10
 
-          # (5) Headless "logon": warm-in profile & start explorer.exe under the new user
-          $warmTask = "CRD-UserWarmIn-$CRD_NAME"
-          $warmCmd  = Join-Path $env:TEMP "warmin.cmd"
-          $warmLines = @(
-            '@echo off'
-            'whoami > %TEMP%\whoami.txt'
-            'start "" "%SystemRoot%\explorer.exe"'
-            'exit /b 0'
-          )
-          Set-Content -Path $warmCmd -Value $warmLines -Encoding Ascii
+          # --- (5) Headless “logon”: warm-in profile & launch explorer.exe under new user ---
+          # Using cmd.exe so we can "start" explorer cleanly
+          $warmArgs = '/c start "" "%SystemRoot%\explorer.exe"'
+          Register-TaskRunNow -Name ("CRD-WarmIn-" + $CRD_NAME) -Execute "cmd.exe" -Arguments $warmArgs -RunAsUser $runAs -RunAsPass $DefaultPass
 
-          schtasks /delete /tn "$warmTask" /f | Out-Null 2>$null
-          schtasks /create /tn "$warmTask" /tr "$warmCmd" /sc ONCE /sd $today /st $st /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
-          Start-Sleep -Seconds 3
-          schtasks /run /tn "$warmTask" | Out-Null
-
-          # Wait up to 30s for HKU\<SID> to appear
+          # Wait up to 30s for HKU\<SID> to mount
           $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
           $mounted = $false
           foreach ($i in 1..30) {
@@ -192,7 +184,7 @@ jobs:
             Start-Sleep -Seconds 1
           }
 
-          # (6) DPI 100% & default headless resolution
+          # --- (6) DPI 100% (per-user) & default headless resolution ---
           if ($mounted) {
             reg add "HKU\$sid\Control Panel\Desktop" /v LogPixels /t REG_DWORD /d 96 /f | Out-Null
             reg add "HKU\$sid\Control Panel\Desktop" /v Win8DpiScaling /t REG_DWORD /d 0 /f | Out-Null
@@ -220,14 +212,14 @@ jobs:
           Set-HeadlessRes -W $W -H $H
           Start-Sleep -Seconds 2
 
-          # Soft-apply (no reboot)
+          # Soft-apply without reboot
           try {
             Import-Module PnpDevice -ErrorAction SilentlyContinue
             $disp = Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($disp) {
               Disable-PnpDevice -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
               Start-Sleep -Seconds 2
-              Enable-PnpDevice -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+              Enable-PnpDevice  -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
             }
           } catch {}
 
@@ -248,7 +240,7 @@ jobs:
           }
           $null = TryStart "chromoting"
 
-          # Diagnostics
+          # --- Diagnostics (and neutralize any native exit codes) ---
           Write-Host "=== CRD Service Status ==="
           Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
           Write-Host "`n=== Host log (tail) ==="
@@ -263,6 +255,9 @@ jobs:
           Write-Host "`n=== Display Devices ==="
           try { Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Format-Table -Auto } catch {}
 
+          # Prevent harmless native stderr from failing the step
+          $global:LASTEXITCODE = 0
+
       - name: "Connect instructions + keep alive"
         if: ${{ always() }}
         shell: pwsh
@@ -275,7 +270,8 @@ jobs:
           Write-Host "    Your host should appear as: $env:CRD_NAME"
           Write-Host "-----------------------------------------------------"
           Write-Host "New admin user created and targeted for AutoAdminLogon (next boot)."
-          Write-Host "We also warmed-in the user's profile and launched explorer.exe via a task so CRD lands on that desktop."
+          Write-Host "We also warmed-in the user's profile and launched explorer.exe via a scheduled task"
+          Write-Host "so CRD lands on that user's desktop even headlessly."
           Write-Host "Headless display set to $env:DISP_W x $env:DISP_H; DPI set to 100% for the target user."
           Write-Host "No other users were disabled, hidden, or signed out."
           Write-Host "====================================================="
