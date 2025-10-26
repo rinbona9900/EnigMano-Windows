@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows — Magical vPro"
+name: "⚡ EnigMano GCRD Windows — Magical vPro (Stable)"
 
 on:
   workflow_dispatch:
@@ -91,6 +91,8 @@ jobs:
           Start-Sleep -Seconds 2
           net localgroup Administrators $TargetUser /add
           Start-Sleep -Seconds 2
+          # Also add to Remote Desktop Users (not required for CRD, but harmless)
+          try { net localgroup "Remote Desktop Users" $TargetUser /add | Out-Null } catch {}
           if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
             try { Set-LocalUser -Name $TargetUser -PasswordNeverExpires $true } catch {}
           }
@@ -105,7 +107,7 @@ jobs:
           & reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
           Start-Sleep -Seconds 2
 
-          # (Cosmetic only; does NOT hide/disable anyone)
+          # Cosmetic only; does NOT hide/disable anyone
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DontDisplayLastUsername /t REG_DWORD /d 1 /f | Out-Null
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v HideFastUserSwitching  /t REG_DWORD /d 1 /f | Out-Null
           Start-Sleep -Seconds 1
@@ -158,20 +160,11 @@ jobs:
 
           $regTask = "CRD-Register-$CRD_NAME"
           $regCmd  = Join-Path $env:TEMP "crd_register.cmd"
-          @'
-@echo off
-"%~dp0.\nul" >nul
-'@ | Out-Null   # placeholder, keeps here-string structure valid (no-op)
-
-          @'
-@echo off
-'@ | Out-File -FilePath $regCmd -Encoding ASCII -Force
           @"
-"$CRD_EXE" $args
-"@ | Out-File -FilePath $regCmd -Encoding ASCII -Append
-          @'
+@echo off
+""$CRD_EXE"" $args
 exit /b %errorlevel%
-'@ | Out-File -FilePath $regCmd -Encoding ASCII -Append
+"@ | Out-File -FilePath $regCmd -Encoding ASCII -Force
 
           schtasks /delete /tn "$regTask" /f | Out-Null 2>$null
           schtasks /create /tn "$regTask" /tr "$regCmd" /sc ONCE /sd $today /st $st /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
@@ -271,7 +264,7 @@ exit /b 0
           $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
           if (Test-Path $log) { Get-Content $log -Tail 150 }
 
-          Write-Host "`n=== Local Users (only new user added) ==="
+          Write-Host "`n=== Local Users (only new user added; others untouched) ==="
           Get-LocalUser | Select-Object Name,Enabled | Format-Table -Auto
 
           Write-Host "`n=== AutoAdminLogon Target ==="
