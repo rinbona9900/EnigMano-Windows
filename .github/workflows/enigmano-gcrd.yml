@@ -12,7 +12,7 @@ on:
         required: true
         default: ""
       GCRD_PIN:
-        description: "PIN (≥6 digits). Leave blank to use the word 'EnigMano' (auto-converted to digits)."
+        description: "PIN (≥6 digits). Leave blank to use the word 'EnigMano' (auto-converted to digits)"
         required: false
         default: ""
       USERNAME:
@@ -34,7 +34,7 @@ on:
 
 jobs:
   deploy-enigmano:
-    name: "🚀 Deploy EnigMano Instance ${ { github.event.inputs.INSTANCE } }"
+    name: "🚀 Deploy EnigMano Instance ${{ github.event.inputs.INSTANCE }}"
     runs-on: windows-latest
     permissions:
       contents: read
@@ -52,7 +52,7 @@ jobs:
       USERNAME_INPUT: ${{ github.event.inputs.USERNAME }}
       PASSWORD_INPUT: ${{ github.event.inputs.PASSWORD }}
       GCRD_REDIRECT_URL_INPUT: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
-      RUN_ENIGMANO_PS1_AFTER: ${{ github.event.inputs.RUN_ENIGMANO_PS1_AFTER }}
+      RUN_ENIGMANO_PS1_AFTER_INPUT: ${{ github.event.inputs.RUN_ENIGMANO_PS1_AFTER }}
 
     steps:
       - name: ✨ Banner
@@ -78,16 +78,15 @@ jobs:
           Write-Host "👤 User (requested)    : " + ($(if($env:USERNAME_INPUT){$env:USERNAME_INPUT}else{"runneradmin"}))
           Write-Host "🔗 Redirect URL       : $env:GCRD_REDIRECT_URL_INPUT"
           Write-Host "🔑 PIN Provided?      : " ($env:GCRD_PIN_INPUT -ne "" )
-          Write-Host "▶️  Run PS1 After?      : $env:RUN_ENIGMANO_PS1_AFTER"
+          Write-Host "▶️  Run PS1 After?      : $env:RUN_ENIGMANO_PS1_AFTER_INPUT"
           Write-Host "==============================================="
 
-      - name: 🧪 Normalize GCRD input (code, redirect, PIN) + defaults
-        id: normalize
+      - name: 🧪 Normalize inputs (OAuth code, redirect, PIN, user) + set flags
         shell: pwsh
         run: |
           function Fail($m){ Write-Error $m; exit 1 }
 
-          # OAuth code: accept full command or just code
+          # --- OAuth code: accept full command or just code ---
           $raw = $env:SSH_CODE_OR_CMD
           if (-not $raw) { Fail "❌ Missing SSH_CODE_OR_CMD." }
 
@@ -95,18 +94,18 @@ jobs:
           if ($raw -match '--code="([^"]+)"') {
             $code = $Matches[1]
           } elseif ($raw -match '^\s*"%PROGRAMFILES\(X86\)%\\Google\\Chrome Remote Desktop\\CurrentVersion\\remoting_start_host\.exe"') {
-            Fail "❌ Could not parse --code from the provided command. Paste either the full command again or just the code string."
+            Fail "❌ Could not parse --code from the provided command. Paste the full command again or just the code."
           } else {
             $code = $raw.Trim()
           }
           if (-not $code) { Fail "❌ Empty OAuth code after parsing." }
 
-          # Redirect URL
+          # --- Redirect URL ---
           $redirect = $env:GCRD_REDIRECT_URL_INPUT
           if (-not $redirect) { $redirect = "https://remotedesktop.google.com/_/oauthredirect" }
           if ($raw -match '--redirect-url="([^"]+)"') { $redirect = $Matches[1] }
 
-          # PIN handling
+          # --- PIN logic ---
           $userPin = $env:GCRD_PIN_INPUT
           function Convert-ToT9($text){
             $map = @{
@@ -119,12 +118,10 @@ jobs:
               elseif ($_ -match '\d') { $_ }
             }) -join ''
           }
-
           if ($userPin -and ($userPin -match '^\d{6,}$')) {
             $pin = $userPin
             $pinSource = "input"
           } else {
-            # Default to word 'EnigMano' (converted to numeric)
             $t9 = Convert-ToT9 "EnigMano"   # -> 3644266
             if ($t9 -and $t9.Length -ge 6) {
               $pin = $t9
@@ -135,25 +132,30 @@ jobs:
             }
           }
 
-          # Admin user defaulting
+          # --- User defaults ---
           $user = if ($env:USERNAME_INPUT) { $env:USERNAME_INPUT } else { "runneradmin" }
           $pass = if ($env:PASSWORD_INPUT) { $env:PASSWORD_INPUT } else { "P@ssw0rd!" }
 
-          # Export normalized values
+          # --- Whether to run PS1 afterward ---
+          $runStr = ($env:RUN_ENIGMANO_PS1_AFTER_INPUT + "").ToLower()
+          $runPs1 = if ($runStr -match '^(y|yes|true|1)$') { 'true' } else { 'false' }
+
+          # Export normalized values & flag
           "GCRD_CODE=$code"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GCRD_REDIRECT=$redirect" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GCRD_PIN=$pin"           | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_USER=$user"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TARGET_PASS=$pass"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUN_PS1=$runPs1"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Mask sensitive values
+          # Mask secrets
           Write-Host "::add-mask::$code"
           Write-Host "::add-mask::$pass"
           Write-Host "::add-mask::$pin"
 
-          Write-Host "::notice title=GCRD Normalized::Code captured. Redirect: $redirect. PIN source: $pinSource. User: $user"
+          Write-Host "::notice title=GCRD Normalized::Code captured. Redirect: $redirect. PIN source: $pinSource. User: $user. Run PS1: $runPs1"
 
-      - name: 👤 Ensure local admin account exists & is enabled
+      - name: 👤 Ensure local admin exists & is enabled
         shell: pwsh
         run: |
           function Ensure-LocalAdmin($u,$p){
@@ -207,7 +209,7 @@ jobs:
           "CRD_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "::notice title=GCRD Path::Using '$exe'"
 
-      - name: 🔐 Register CRD host as the target admin user (headless)
+      - name: 🔐 Register CRD host under the target admin user (headless)
         shell: pwsh
         run: |
           $sec = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
@@ -218,7 +220,7 @@ jobs:
             "--name=""$env:COMPUTERNAME"""
             "--pin=""$env:GCRD_PIN"""
           ) -join ' '
-          Write-Host "➡️  Running CRD registration in context of '$($env:TARGET_USER)' ..."
+          Write-Host "➡️  Running CRD registration as '$($env:TARGET_USER)' ..."
           $proc = Start-Process -FilePath $env:CRD_EXE -ArgumentList $args -Credential $cred -PassThru -WindowStyle Hidden
           $proc.WaitForExit()
           Write-Host "📨 remoting_start_host.exe exited with code: $($proc.ExitCode)"
@@ -276,8 +278,8 @@ jobs:
           - **Note**         : If you left PIN blank, the word 'EnigMano' was auto-converted to digits to satisfy GCRD.
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
-      - name: 📥 (Optional) Fetch EnigMano-Instance.ps1 (GitLab / win10)
-        if: ${{ contains(toLower(env.RUN_ENIGMANO_PS1_AFTER), 'y') }}
+      - name: 📥 Fetch EnigMano-Instance.ps1 (GitLab / win10)
+        if: env.RUN_PS1 == 'true'
         shell: pwsh
         run: |
           $url = "https://gitlab.com/Shahzaib-YT/enigmano-win10-with-sound/-/raw/main/EnigMano-Instance.ps1"
@@ -289,8 +291,8 @@ jobs:
           }
           Write-Host "✅ EnigMano-Instance.ps1 downloaded."
 
-      - name: ⚔️ (Optional) Execute EnigMano-Instance.ps1
-        if: ${{ contains(toLower(env.RUN_ENIGMANO_PS1_AFTER), 'y') }}
+      - name: ⚔️ Execute EnigMano-Instance.ps1
+        if: env.RUN_PS1 == 'true'
         shell: pwsh
         run: |
           Write-Host "🚦 Initiating EnigMano-Instance.ps1"
