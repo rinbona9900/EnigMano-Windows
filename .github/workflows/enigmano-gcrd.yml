@@ -19,10 +19,6 @@ on:
         description: "Create this local admin (leave blank to use runneradmin)"
         required: false
         default: ""
-      NEW_PASSWORD:
-        description: "Password for NEW_USERNAME, or for runneradmin if NEW_USERNAME is blank (default: Enigman0)"
-        required: false
-        default: ""
       GCRD_REDIRECT_URL:
         description: "Redirect URL from Google (leave default)"
         required: false
@@ -48,202 +44,195 @@ jobs:
       RAW_SETUP: ${{ inputs.SETUP_CMD_OR_CODE }}
       RAW_PIN: ${{ inputs.GCRD_PIN }}
       RAW_NEW_USERNAME: ${{ inputs.NEW_USERNAME }}
-      RAW_NEW_PASSWORD: ${{ inputs.NEW_PASSWORD }}
       RAW_REDIRECT_URL: ${{ inputs.GCRD_REDIRECT_URL }}
       RAW_TTL: ${{ inputs.TTL_MINUTES }}
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
 
     steps:
-      - name: "Normalize inputs + derive defaults (masking)"
+      - name: "Normalize inputs + derive defaults (masking) → one-shot prepare + CRD install + register + verify"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
+          # ---------- Normalize Inputs ----------
           $instance     = ($env:INSTANCE         | ForEach-Object { $_.Trim() })
           $setupInput   = ($env:RAW_SETUP        | ForEach-Object { $_.Trim() })
           $redirectUrl  = ($env:RAW_REDIRECT_URL | ForEach-Object { $_.Trim() })
           $newUser      = ($env:RAW_NEW_USERNAME | ForEach-Object { $_.Trim() })
-          $newPass      = ($env:RAW_NEW_PASSWORD | ForEach-Object { $_.Trim() })
           $pinInput     = ($env:RAW_PIN          | ForEach-Object { $_.Trim() })
           $ttlStr       = ($env:RAW_TTL          | ForEach-Object { $_.Trim() })
 
-          $out = 0
-          if (-not [int]::TryParse($ttlStr, [ref]$out)) { $ttlStr = "120" }
+          $tmp = 0
+          if (-not [int]::TryParse($ttlStr, [ref]$tmp)) { $ttlStr = "120" }
           $ttl = [int]$ttlStr
           if ($ttl -lt 10) { $ttl = 10 }
 
+          # All users default to this password
+          $DefaultPass = "EnigMan0"
+          Write-Output "::add-mask::$DefaultPass"
+
+          # Auto-PIN if blank (12 digits, deterministic)
           if ([string]::IsNullOrWhiteSpace($pinInput)) {
             $seed = "EnigMano$instance"
             $sha  = [System.Security.Cryptography.SHA256]::Create()
             $buf  = [System.Text.Encoding]::UTF8.GetBytes($seed)
             $pinInput = (($sha.ComputeHash($buf) | ForEach-Object { $_ % 10 }) -join '').Substring(0,12)
           }
+          Write-Output "::add-mask::$pinInput"
 
+          # Target user: NEW_USERNAME or runneradmin. Force password to default.
           if ([string]::IsNullOrWhiteSpace($newUser)) {
-            $targetUser = "runneradmin"
-            $targetPass = if ([string]::IsNullOrWhiteSpace($newPass)) { "Enigman0" } else { $newPass }
+            $TargetUser = "runneradmin"
           } else {
-            $targetUser = $newUser
-            if ([string]::IsNullOrWhiteSpace($newPass)) { throw "NEW_PASSWORD is required when NEW_USERNAME is provided." }
-            $targetPass = $newPass
+            $TargetUser = $newUser
           }
 
-          @($targetPass, $pinInput) | ForEach-Object {
-            if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" }
-          }
-          if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { Write-Output "::add-mask::$($Matches[1])" }
-          if ($setupInput -match '4\/[0-9A-Za-z\-_]+')        { Write-Output "::add-mask::$($Matches[0])" }
-
-          "INSTANCE=$instance"                                        | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TARGET_USER=$targetUser"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TARGET_PASS=$targetPass"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
-          "PIN=$pinInput"                                             | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SETUP_INPUT=$setupInput"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
-          "REDIRECT_URL=$redirectUrl"                                 | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Host name & TTL to env (for next step)
           "TTL_MIN=$ttl"                                              | Out-File -FilePath $env:GITHUB_ENV -Append
           "HOST_NAME=EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"    | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: "Ensure target account exists and is admin (no WMIC)"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if ($env:TARGET_USER -eq "runneradmin") {
-            net user runneradmin "$env:TARGET_PASS"
-            if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
-              try { Set-LocalUser -Name "runneradmin" -PasswordNeverExpires $true } catch {}
-            }
+          # ---------- Ensure Target Account (sole active admin intent) ----------
+          if ($TargetUser -eq "runneradmin") {
+            # Update runneradmin password and ensure admin
+            net user runneradmin "$DefaultPass"
+            try { net localgroup Administrators runneradmin /add | Out-Null } catch {}
           } else {
-            if (-not (Get-LocalUser -Name $env:TARGET_USER -ErrorAction SilentlyContinue)) {
-              net user $env:TARGET_USER "$env:TARGET_PASS" /add
+            # Create or update requested admin
+            if (-not (Get-LocalUser -Name $TargetUser -ErrorAction SilentlyContinue)) {
+              net user $TargetUser "$DefaultPass" /add
             } else {
-              net user $env:TARGET_USER "$env:TARGET_PASS"
+              net user $TargetUser "$DefaultPass"
             }
-            net localgroup Administrators $env:TARGET_USER /add
-            if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
-              try { Set-LocalUser -Name $env:TARGET_USER -PasswordNeverExpires $true } catch {}
+            net localgroup Administrators $TargetUser /add
+          }
+
+          # Try to set PasswordNeverExpires when available
+          if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+            try { Set-LocalUser -Name $TargetUser -PasswordNeverExpires $true } catch {}
+          }
+
+          # ---------- Enforce "only one user" (best-effort within hosted runner constraints) ----------
+          # We keep TargetUser; attempt to delete/disable others (system/built-ins are skipped).
+          $protected = @('Administrator','DefaultAccount','WDAGUtilityAccount','Guest')
+          $currentUser = ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1])
+
+          Get-LocalUser | ForEach-Object {
+            $name = $_.Name
+            if ($name -eq $TargetUser) {
+              # ensure default password on target
+              try { net user $name "$DefaultPass" | Out-Null } catch {}
+              return
+            }
+            if ($protected -contains $name) {
+              # Set default password where possible and disable non-essential built-ins
+              try { net user $name "$DefaultPass" | Out-Null } catch {}
+              try { if ($name -ne 'Administrator') { Disable-LocalUser -Name $name -ErrorAction SilentlyContinue } } catch {}
+              return
+            }
+            if ($name -eq $currentUser) {
+              # Cannot remove the account running this job; align password and carry on
+              try { net user $name "$DefaultPass" | Out-Null } catch {}
+              return
+            }
+            # Try delete; if fails, disable
+            try {
+              net user $name /delete | Out-Null
+            } catch {
+              try { Disable-LocalUser -Name $name -ErrorAction SilentlyContinue } catch {}
             }
           }
 
-      - name: "Enable RDP & firewall (completeness)"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          # If target is not runneradmin and runneradmin exists but is the current account,
+          # align password and keep; CRD registration will still run as TargetUser via scheduled task.
+
+          # ---------- Enable RDP locally (note: inbound to GH runner is not possible) ----------
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
-          Start-Service TermService
+          try { Start-Service TermService } catch {}
 
-      - name: "Download & install Chrome Remote Desktop Host (silent)"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          # ---------- Install Chrome Remote Desktop Host ----------
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
-          Invoke-WebRequest -Uri "$env:MSI_URL" -OutFile $msi
+          Invoke-WebRequest -Uri "${{ env.MSI_URL }}" -OutFile $msi
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
-          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
-          $exe = Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe'
-          if (-not (Test-Path $exe)) { throw "remoting_start_host.exe not found at: $exe" }
-          "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: "Apply CRD stability policies (no early restart)"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f
-          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f
-          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f
-          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f
+          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $CRD_EXE = Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe'
+          if (-not (Test-Path $CRD_EXE)) { throw "remoting_start_host.exe not found at: $CRD_EXE" }
+
+          # ---------- Apply CRD stability policies (no early restart) ----------
+          reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f | Out-Null
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f | Out-Null
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f | Out-Null
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f | Out-Null
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
 
-      - name: "Build CRD args (from full command OR from code)"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $name = "$env:HOST_NAME"
-          $inputText = "$env:SETUP_INPUT"
-
+          # ---------- Parse OAuth code from input ----------
           $code = $null
-          if ($inputText -match 'code="?([0-9A-Za-z\/\-_]+)"?') { $code = $Matches[1] }
-          elseif ($inputText -match '(4\/[0-9A-Za-z\-_]+)')     { $code = $Matches[1] }
+          if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { $code = $Matches[1] }
+          elseif ($setupInput -match '(4\/[0-9A-Za-z\-_]+)')     { $code = $Matches[1] }
+          if (-not $code) { throw "No OAuth code detected. Paste full command w/ --code=... or the code starting with '4/'." }
+          Write-Output "::add-mask::$code"
 
-          if (-not $code) {
-            throw "No OAuth code detected. Paste either the full command containing --code=... or the code starting with '4/'."
-          }
-
-          $pin = $env:PIN
-          if ($pin.Length -lt 6) { throw "GCRD_PIN must be at least 6 digits." }
-          if ($pin -notmatch '^\d{6,}$') { throw "GCRD_PIN must contain digits only." }
-
+          # ---------- Build CRD args ----------
+          $CRD_NAME = "EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"
           $args = @(
             "--code=""$code"""
-            "--redirect-url=""$env:REDIRECT_URL"""
-            "--name=""$name"""
-            "--pin=""$pin"""
+            "--redirect-url=""$redirectUrl"""
+            "--name=""$CRD_NAME"""
+            "--pin=""$pinInput"""
           ) -join " "
 
-          Write-Output "::add-mask::$code"
-          Write-Output "::add-mask::$pin"
+          # Export for next step
+          "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          "CRD_ARGS=$args" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CRD_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: "Register CRD host as target user via Scheduled Task (reliable, elevated)"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $exe  = "$env:CRD_START_HOST"
-          $args = "$env:CRD_ARGS"
-          $task = "CRD-Register-$($env:HOST_NAME)"
+          # ---------- Register CRD as TargetUser via Scheduled Task (reliable elevated run) ----------
+          $task = "CRD-Register-$CRD_NAME"
           $cmd  = Join-Path $env:TEMP "crd_register.cmd"
+          "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
 
-          $content = "@echo off`r`n"
-          $content += "`"$exe`" $args`r`n"
-          $content += "exit /b %errorlevel%`r`n"
-          Set-Content -Path $cmd -Value $content -Encoding ASCII -Force
+          # Ensure TargetUser has the default password (again)
+          try { net user $TargetUser "$DefaultPass" | Out-Null } catch {}
 
-          schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st 00:00 /RL HIGHEST /RU "$env:COMPUTERNAME\$env:TARGET_USER" /RP "$env:TARGET_PASS" /F | Out-Null
+          schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st 00:00 /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
           schtasks /run /tn "$task" | Out-Null
-
           Start-Sleep -Seconds 10
 
-      - name: "Post-registration: start CRD service with retries"
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
+          # ---------- Start CRD service with retries (post-registration) ----------
           function TryStart([string]$name) {
+            $ErrorActionPreference = "Continue"
             $s = Get-Service -Name $name -ErrorAction SilentlyContinue
             if ($s) {
               sc.exe config $name start= auto | Out-Null
-              for ($i=0; $i -lt 6; $i++) {
+              for ($i=0; $i -lt 8; $i++) {
                 try { Start-Service $name -ErrorAction Stop } catch { Start-Sleep -Seconds 5; continue }
                 $s = Get-Service -Name $name -ErrorAction SilentlyContinue
                 if ($s.Status -eq 'Running') { return $true }
-                Start-Sleep -Seconds 5
+                Start-Sleep -Seconds 3
               }
             }
             return $false
           }
 
-          $ok = TryStart "chromoting"
-          if (-not $ok) {
-            $svc = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
-            if ($svc) { [void](TryStart $svc.Name) }
+          $started = TryStart "chromoting"
+          if (-not $started) {
+            $svc2 = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
+            if ($svc2) { [void](TryStart $svc2.Name) }
           }
 
-          Write-Host "CRD service status (if present):"
+          # ---------- Verify & tail logs ----------
+          Write-Host "=== CRD Service Status ==="
           Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
           Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue | Format-Table -Auto
 
-      - name: "Verify & tail logs"
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          Write-Host "=== Host log (tail) ==="
+          Write-Host "`n=== Host log (tail) ==="
           $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
           if (Test-Path $log) { Get-Content $log -Tail 150 }
+
+          Write-Host "`n=== Accounts (post-enforcement) ==="
+          Get-LocalUser | Select-Object Name,Enabled | Format-Table -Auto
+
           Write-Host "`n=== Whoami / Groups ==="
           whoami /all
 
