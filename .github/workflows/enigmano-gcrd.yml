@@ -40,7 +40,6 @@ jobs:
       INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
       REPO: ${{ github.repository }}
       DEPLOYMENT_ID: ${{ github.run_id }}
-      WORKFLOW_FILE: "enigmano-gcrd.yml"
 
       SSH_CODE_OR_CMD: ${{ github.event.inputs.SSH_CODE_OR_CMD }}
       GCRD_PIN_INPUT: ${{ github.event.inputs.GCRD_PIN }}
@@ -49,7 +48,7 @@ jobs:
       GCRD_REDIRECT_URL_INPUT: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
 
     steps:
-      # 1) Warm-up + Normalize inputs (code/redirect/pin/user) + Defaults
+      # 1) Warm-up + Normalize inputs (code/redirect/pin/user)
       - name: "✨ Warm-Up (50s) & Normalize"
         shell: pwsh
         run: |
@@ -92,16 +91,14 @@ jobs:
           if ($userPin -and ($userPin -match '^\d{6,}$')) {
             $pin = $userPin
           } else {
-            $t9 = Convert-ToT9 "EnigMano"   # 3644266
+            $t9 = Convert-ToT9 "EnigMano"   # -> 3644266
             $pin = if ($t9 -and $t9.Length -ge 6) { $t9 } else { "919191" }
           }
 
-          # Choose target user:
-          # - If NEW_USERNAME provided: use NEW_USERNAME + NEW_PASSWORD (required)
-          # - Else use runneradmin with password Enigman0 (per your plan)
+          # Target user: NEW_* or runneradmin/Enigman0
           if ($env:NEW_USERNAME_INPUT) {
-            $user = $env:NEW_USERNAME_INPUT
             if (-not $env:NEW_PASSWORD_INPUT) { Fail "NEW_PASSWORD is required when NEW_USERNAME is provided." }
+            $user = $env:NEW_USERNAME_INPUT
             $pass = $env:NEW_PASSWORD_INPUT
           } else {
             $user = "runneradmin"
@@ -122,26 +119,22 @@ jobs:
 
           Write-Host ("✅ Normalized: User=" + $user + " | Redirect=" + $redirect + " | PIN=(hidden)")
 
-      # 2) Ensure admin (runneradmin -> Enigman0 OR create new) + Enable RDP (protocol + firewall + groups)
+      # 2) Ensure admin (runneradmin -> Enigman0 OR create new) + Enable RDP (protocol + firewall + group)
       - name: "🛡️ Ensure Admin & Enable RDP"
         shell: pwsh
         run: |
           function Ensure-Admin-NetOnly($u,$p){
             if ($u -ieq "runneradmin") {
-              # Reset built-in GH admin password to plan's value
               & net user runneradmin $p /y | Out-Null
               & net user runneradmin /active:yes | Out-Null
             } else {
-              # Create a new local admin
               & net user $u $p /add /y | Out-Null
               & net localgroup administrators $u /add | Out-Null
               & net user $u /active:yes | Out-Null
             }
-            # Also grant RDP group membership
             & net localgroup "Remote Desktop Users" $u /add | Out-Null
             Write-Host "👤 Admin ready: $u"
           }
-
           Ensure-Admin-NetOnly -u $env:TARGET_USER -p $env:TARGET_PASS
 
           # Enable RDP protocol + firewall
@@ -171,61 +164,55 @@ jobs:
           "CRD_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host ("📍 CRD Path: " + $exe)
 
-      # 4) Register CRD using elevated Scheduled Task (wrapper) + verify w/ logs and service checks
-      - name: "🔐 Register CRD via Wrapper Task & Verify"
+      # 4) Register CRD via SYSTEM wrapper task + poll task result + tail logs + verify host files/service
+      - name: "🔐 Register CRD (SYSTEM) & Verify"
         shell: pwsh
         run: |
           function Fail($m){ Write-Error $m; exit 1 }
 
-          # Short wrapper to bypass schtasks /TR length limit and capture logs
           $wrapper = Join-Path $env:WINDIR "Temp\enigmano-crd-register.ps1"
           $logPath = Join-Path $env:WINDIR "Temp\enigmano-crd-register.log"
 
           $lines = @(
             '$ErrorActionPreference = "Continue"'
             '$exe = "' + $env:CRD_EXE.Replace('"','\"') + '"'
-            '$args = @("--code=""' + $env:GCRD_CODE.Replace('"','\"') + '""","--redirect-url=""' + $env:GCRD_REDIRECT.Replace('"','\"') + '""","--name="+$env:COMPUTERNAME,"--pin=' + $env:GCRD_PIN + '")'
+            '$args = @("--code=' + $env:GCRD_CODE.Replace('"','\"') + '","--redirect-url=' + $env:GCRD_REDIRECT.Replace('"','\"') + '","--name=" + $env:COMPUTERNAME,"--pin=' + $env:GCRD_PIN + '")'
             'try {'
-            '  $p = Start-Process -FilePath $exe -ArgumentList $args -RedirectStandardOutput "' + $logPath + '" -RedirectStandardError "' + $logPath + '" -NoNewWindow -PassThru -Wait'
+            '  $p = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru -Wait'
             '  "[CRD] ExitCode=" + $p.ExitCode | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
             '} catch { "[CRD-ERR] " + ($_ | Out-String) | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append }'
             'Get-ChildItem "C:\ProgramData\Google\Chrome Remote Desktop" -ErrorAction SilentlyContinue | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
-            'exit 0'
+            'exit $LASTEXITCODE'
           )
           Set-Content -Path $wrapper -Value $lines -Encoding ASCII
           Write-Host ("🧩 Wrapper created: " + $wrapper)
 
-          # Elevated Scheduled Task (run as chosen admin)
           $task  = "EnigManoCRDRegister"
           $start = (Get-Date).AddMinutes(1).ToString("HH:mm")
           $tr    = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $wrapper + '"'
-          schtasks /Create /F /RL HIGHEST /SC ONCE /ST $start /TN $task /TR "$tr" /RU "$($env:TARGET_USER)" /RP "$($env:TARGET_PASS)" | Out-Null
+          # Run as SYSTEM (no password, highest privileges)
+          schtasks /Create /F /RL HIGHEST /SC ONCE /ST $start /TN $task /TR "$tr" /RU "NT AUTHORITY\SYSTEM" | Out-Null
           schtasks /Run /TN $task | Out-Null
-          Write-Host ("🚀 Registration task launched as " + $env:TARGET_USER)
+          Write-Host "🚀 Registration task launched as SYSTEM."
 
-          # Defensive firewall allow for the host process
-          try {
-            New-NetFirewallRule -DisplayName "Chrome Remote Desktop Host" -Direction Outbound -Program $env:CRD_EXE -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
-          } catch {}
-
-          # Verify: wait up to ~3 minutes, print log tail, ensure service(s)
-          function Ensure-Service($n){
-            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
-            if ($s -and $s.Status -ne "Running") { try { Start-Service -Name $n } catch {} }
-          }
-
+          # Poll scheduled task + tail wrapper log; up to ~4 minutes
           $ok = $false
-          for ($i=1; $i -le 36; $i++) {
+          $attempts = 48
+          for ($i=1; $i -le $attempts; $i++) {
             Start-Sleep -Seconds 5
-
-            # Try common CRD service names
-            Ensure-Service "chromoting"
-            Ensure-Service "ChromeRemoteDesktopService"
 
             if (Test-Path $logPath) {
               Write-Host "—— CRD wrapper log snapshot ——"
-              Get-Content $logPath -ErrorAction SilentlyContinue | Select-Object -Last 10
+              Get-Content $logPath -ErrorAction SilentlyContinue | Select-Object -Last 15
               Write-Host "——————————————"
+            }
+
+            $q = schtasks /Query /TN $task /V /FO LIST | Out-String
+            $last = ($q | Select-String -Pattern "Last Task Result:\s*(.+)$").Matches.Value
+            $status = ($q | Select-String -Pattern "Status:\s*(.+)$").Matches.Value
+            if ($last) {
+              # Show parsed status/result to logs
+              Write-Host ("[TaskStatus] " + ($status -replace 'Status:\s*','') + " | [LastResult] " + ($last -replace 'Last Task Result:\s*',''))
             }
 
             $hostPaths = @(
@@ -236,16 +223,19 @@ jobs:
             if ($hostPaths.Count -gt 0) { $ok = $true; break }
           }
 
-          if ($ok) {
-            Write-Host "✅ CRD host registered (host file present)."
-          } else {
-            Write-Host "⚠️ Host files not detected; most often this means the OAuth code was expired/used. Generate a fresh code and re-run."
+          if ($ok) { Write-Host "✅ CRD host registered (host file present)." }
+          else { Write-Host "⚠️ Host files not detected; most often this means the OAuth code was expired/used. Generate a fresh code and re-run." }
+
+          # Try to start likely service names (depends on host build)
+          foreach($svcName in @("chromoting","ChromeRemoteDesktopService","chromeremotedesktopservice")){
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Running") { try { Start-Service -Name $svcName } catch {} }
           }
 
-          # Cleanup the task (keep wrapper/log for inspection)
+          # Keep task artifacts for inspection, but remove the task
           schtasks /Delete /F /TN $task | Out-Null
 
-      # 5) Final Summary (username, password, PIN, links)
+      # 5) Final Summary (username, password, PIN)
       - name: "🧾 Connection Summary"
         shell: pwsh
         run: |
