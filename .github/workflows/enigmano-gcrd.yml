@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows 10"
+name: "⚡ EnigMano GCRD Windows"
 
 on:
   workflow_dispatch:
@@ -7,247 +7,229 @@ on:
         description: "Instance number"
         required: true
         default: "1"
-      SSH_CODE_OR_CMD:
-        description: "Paste the entire 'Setup via SSH' command OR just the OAuth code"
+      SETUP_CMD_OR_CODE:
+        description: "Paste the full 'Setup via SSH' command OR just the OAuth code starting with 4/"
         required: true
         default: ""
       GCRD_PIN:
-        description: "PIN (≥6 digits). Leave blank to use digits derived from 'EnigMano'"
+        description: "PIN (≥6 digits). Leave blank to auto-derive from 'EnigMano'+INSTANCE"
         required: false
         default: ""
       NEW_USERNAME:
-        description: "Create this admin (leave blank to use runneradmin)"
+        description: "Create this local admin (leave blank to use runneradmin)"
         required: false
         default: ""
       NEW_PASSWORD:
-        description: "Password for NEW_USERNAME (ignored if blank)"
+        description: "Password for NEW_USERNAME, or for runneradmin if NEW_USERNAME is blank (default: Enigman0)"
         required: false
         default: ""
       GCRD_REDIRECT_URL:
-        description: "Redirect URL (leave default unless Google changes it)"
+        description: "Redirect URL from Google"
         required: false
         default: "https://remotedesktop.google.com/_/oauthredirect"
+      TTL_MINUTES:
+        description: "Keep-alive duration for this session"
+        required: false
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enigmano-gcrd
+  cancel-in-progress: true
 
 jobs:
-  deploy-enigmano:
-    name: "🚀 Deploy EnigMano Instance ${{ github.event.inputs.INSTANCE }}"
+  setup:
     runs-on: windows-latest
-    permissions:
-      contents: read
-      actions: write
-
+    timeout-minutes: 360
     env:
-      INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
-      REPO: ${{ github.repository }}
-      DEPLOYMENT_ID: ${{ github.run_id }}
-
-      SSH_CODE_OR_CMD: ${{ github.event.inputs.SSH_CODE_OR_CMD }}
-      GCRD_PIN_INPUT: ${{ github.event.inputs.GCRD_PIN }}
-      NEW_USERNAME_INPUT: ${{ github.event.inputs.NEW_USERNAME }}
-      NEW_PASSWORD_INPUT: ${{ github.event.inputs.NEW_PASSWORD }}
-      GCRD_REDIRECT_URL_INPUT: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
-
+      MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
     steps:
-      # 1) Warm-up + Normalize inputs (code/redirect/pin/user)
-      - name: "✨ Warm-Up (50s) & Normalize"
+      - name: Normalize inputs + derive defaults (safe masking)
         shell: pwsh
         run: |
-          Write-Host "🕒 Warming up runner for 50 seconds..."
-          Start-Sleep -Seconds 50
+          $ErrorActionPreference = "Stop"
 
-          function Fail($m){ Write-Error $m; exit 1 }
+          $instance     = "${{ inputs.INSTANCE }}".Trim()
+          $setupInput   = "${{ inputs.SETUP_CMD_OR_CODE }}".Trim()
+          $redirectUrl  = "${{ inputs.GCRD_REDIRECT_URL }}".Trim()
+          $newUser      = "${{ inputs.NEW_USERNAME }}".Trim()
+          $newPass      = "${{ inputs.NEW_PASSWORD }}".Trim()
+          $pinInput     = "${{ inputs.GCRD_PIN }}".Trim()
+          $ttl          = [int]("${{ inputs.TTL_MINUTES }}")
+          if ($ttl -lt 10) { $ttl = 10 }  # sanity
 
-          # Parse OAuth code (accept full command or just code)
-          $raw = $env:SSH_CODE_OR_CMD
-          if (-not $raw) { Fail "Missing SSH_CODE_OR_CMD." }
-          $code = $null
-          if ($raw -match '--code="([^"]+)"') {
-            $code = $Matches[1]
-          } elseif ($raw -match '^\s*"%PROGRAMFILES\(X86\)%\\Google\\Chrome Remote Desktop\\CurrentVersion\\remoting_start_host\.exe"') {
-            Fail "Could not parse --code from the provided command. Paste full command again or just the code."
+          # Compute a deterministic 6-12 digit PIN from 'EnigMano'+INSTANCE if blank
+          if ([string]::IsNullOrWhiteSpace($pinInput)) {
+            $seed = "EnigMano$instance"
+            $sha  = [System.Security.Cryptography.SHA256]::Create()
+            $buf  = [System.Text.Encoding]::UTF8.GetBytes($seed)
+            $hex  = ($sha.ComputeHash($buf) | ForEach-Object { ($_ % 10) }) -join ''
+            $pinInput = $hex.Substring(0,12)  # up to 12 digits allowed; client accepts >=6
+          }
+
+          # Decide target account + password
+          if ([string]::IsNullOrWhiteSpace($newUser)) {
+            $targetUser = "runneradmin"
+            $targetPass = if ([string]::IsNullOrWhiteSpace($newPass)) { "Enigman0" } else { $newPass }
           } else {
-            $code = $raw.Trim()
-          }
-          if (-not $code) { Fail "Empty OAuth code after parsing." }
-
-          # Redirect URL
-          $redirect = $env:GCRD_REDIRECT_URL_INPUT
-          if (-not $redirect) { $redirect = "https://remotedesktop.google.com/_/oauthredirect" }
-          if ($raw -match '--redirect-url="([^"]+)"') { $redirect = $Matches[1] }
-
-          # PIN (numeric ≥6) or derived from "EnigMano"
-          function Convert-ToT9($text){
-            $map = @{
-              'A'=2;'B'=2;'C'=2; 'D'=3;'E'=3;'F'=3; 'G'=4;'H'=4;'I'=4;
-              'J'=5;'K'=5;'L'=5; 'M'=6;'N'=6;'O'=6; 'P'=7;'Q'=7;'R'=7;'S'=7;
-              'T'=8;'U'=8;'V'=8; 'W'=9;'X'=9;'Y'=9;'Z'=9
-            }
-            ($text.ToUpper().ToCharArray() | ForEach-Object {
-              if ($map.ContainsKey($_)) { $map[$_] }
-              elseif ($_ -match '\d') { $_ }
-            }) -join ''
-          }
-          $userPin = $env:GCRD_PIN_INPUT
-          if ($userPin -and ($userPin -match '^\d{6,}$')) {
-            $pin = $userPin
-          } else {
-            $t9 = Convert-ToT9 "EnigMano"   # -> 3644266
-            $pin = if ($t9 -and $t9.Length -ge 6) { $t9 } else { "919191" }
+            $targetUser = $newUser
+            if ([string]::IsNullOrWhiteSpace($newPass)) { throw "NEW_PASSWORD is required when NEW_USERNAME is provided." }
+            $targetPass = $newPass
           }
 
-          # Target user: NEW_* or runneradmin/Enigman0
-          if ($env:NEW_USERNAME_INPUT) {
-            if (-not $env:NEW_PASSWORD_INPUT) { Fail "NEW_PASSWORD is required when NEW_USERNAME is provided." }
-            $user = $env:NEW_USERNAME_INPUT
-            $pass = $env:NEW_PASSWORD_INPUT
-          } else {
-            $user = "runneradmin"
-            $pass = "Enigman0"
-          }
+          # Mask sensitive values in logs
+          @($targetPass, $pinInput) | ForEach-Object { if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" } }
+          if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { Write-Output "::add-mask::$($Matches[1])" }
+          if ($setupInput -match '4\/[0-9A-Za-z\-_]+') { Write-Output "::add-mask::$($Matches[0])" }
 
-          # Export for next steps
-          "GCRD_CODE=$code"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "GCRD_REDIRECT=$redirect" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "GCRD_PIN=$pin"           | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "TARGET_USER=$user"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "TARGET_PASS=$pass"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Persist for later steps
+          echo "INSTANCE=$instance"           | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "TARGET_USER=$targetUser"      | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "TARGET_PASS=$targetPass"      | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "PIN=$pinInput"                | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "SETUP_INPUT=$setupInput"      | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "REDIRECT_URL=$redirectUrl"    | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "TTL_MIN=$ttl"                 | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "HOST_NAME=EnigMano-$instance-${{ github.run_number }}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # Mask sensitive
-          Write-Host "::add-mask::$code"
-          Write-Host "::add-mask::$pass"
-          Write-Host "::add-mask::$pin"
-
-          Write-Host ("✅ Normalized: User=" + $user + " | Redirect=" + $redirect + " | PIN=(hidden)")
-
-      # 2) Ensure admin (runneradmin -> Enigman0 OR create new) + Enable RDP (protocol + firewall + group)
-      - name: "🛡️ Ensure Admin & Enable RDP"
+      - name: Ensure target account exists and is admin
         shell: pwsh
         run: |
-          function Ensure-Admin-NetOnly($u,$p){
-            if ($u -ieq "runneradmin") {
-              & net user runneradmin $p /y | Out-Null
-              & net user runneradmin /active:yes | Out-Null
+          $ErrorActionPreference = "Stop"
+
+          if ($env:TARGET_USER -eq "runneradmin") {
+            net user runneradmin "$env:TARGET_PASS"
+            wmic useraccount where "name='runneradmin'" set PasswordExpires=FALSE | Out-Null
+          } else {
+            if (-not (Get-LocalUser -Name $env:TARGET_USER -ErrorAction SilentlyContinue)) {
+              net user $env:TARGET_USER "$env:TARGET_PASS" /add
             } else {
-              & net user $u $p /add /y | Out-Null
-              & net localgroup administrators $u /add | Out-Null
-              & net user $u /active:yes | Out-Null
+              net user $env:TARGET_USER "$env:TARGET_PASS"
             }
-            & net localgroup "Remote Desktop Users" $u /add | Out-Null
-            Write-Host "👤 Admin ready: $u"
+            net localgroup Administrators $env:TARGET_USER /add
+            wmic useraccount where "name='$env:TARGET_USER'" set PasswordExpires=FALSE | Out-Null
           }
-          Ensure-Admin-NetOnly -u $env:TARGET_USER -p $env:TARGET_PASS
 
-          # Enable RDP protocol + firewall
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-          New-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -PropertyType DWord -Force | Out-Null
+      - name: Enable RDP & firewall (completeness)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Enable RDP
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          # Allow RDP through Windows Firewall
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          Write-Host "🪟 RDP enabled and firewall opened."
+          # Make sure the service is present & started
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService
 
-      # 3) Install Chrome Remote Desktop Host & resolve path
-      - name: "⬇️ Install CRD Host"
+      - name: Download & install Chrome Remote Desktop Host (silent)
         shell: pwsh
         run: |
-          function Fail($m){ Write-Error $m; exit 1 }
-          $url = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $ErrorActionPreference = "Stop"
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
-          Write-Host "🌐 Downloading CRD Host MSI..."
-          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
-          Write-Host "⚙️ Installing (silent)..."
-          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Fail "CRD Host install failed with exit code $($p.ExitCode)" }
-          Write-Host "✅ CRD Host installed."
+          Invoke-WebRequest -Uri "${{ env.MSI_URL }}" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+          # Known path to start-host executable
+          $exe = "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $exe)) { throw "remoting_start_host.exe not found at: $exe" }
+          echo "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          $x86 = Join-Path ${env:ProgramFiles(x86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          $x64 = Join-Path ${env:ProgramFiles} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          $exe = if (Test-Path $x86) { $x86 } elseif (Test-Path $x64) { $x64 } else { "" }
-          if (-not $exe) { Fail "remoting_start_host.exe not found after installation." }
-          "CRD_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host ("📍 CRD Path: " + $exe)
-
-      # 4) Register CRD via SYSTEM wrapper task + poll task result + tail logs + verify host files/service
-      - name: "🔐 Register CRD (SYSTEM) & Verify"
+      - name: Apply CRD stability policies (curtain, auth) and restart service
         shell: pwsh
         run: |
-          function Fail($m){ Write-Error $m; exit 1 }
-
-          $wrapper = Join-Path $env:WINDIR "Temp\enigmano-crd-register.ps1"
-          $logPath = Join-Path $env:WINDIR "Temp\enigmano-crd-register.log"
-
-          $lines = @(
-            '$ErrorActionPreference = "Continue"'
-            '$exe = "' + $env:CRD_EXE.Replace('"','\"') + '"'
-            '$args = @("--code=' + $env:GCRD_CODE.Replace('"','\"') + '","--redirect-url=' + $env:GCRD_REDIRECT.Replace('"','\"') + '","--name=" + $env:COMPUTERNAME,"--pin=' + $env:GCRD_PIN + '")'
-            'try {'
-            '  $p = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru -Wait'
-            '  "[CRD] ExitCode=" + $p.ExitCode | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
-            '} catch { "[CRD-ERR] " + ($_ | Out-String) | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append }'
-            'Get-ChildItem "C:\ProgramData\Google\Chrome Remote Desktop" -ErrorAction SilentlyContinue | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
-            'exit $LASTEXITCODE'
-          )
-          Set-Content -Path $wrapper -Value $lines -Encoding ASCII
-          Write-Host ("🧩 Wrapper created: " + $wrapper)
-
-          $task  = "EnigManoCRDRegister"
-          $start = (Get-Date).AddMinutes(1).ToString("HH:mm")
-          $tr    = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $wrapper + '"'
-          # Run as SYSTEM (no password, highest privileges)
-          schtasks /Create /F /RL HIGHEST /SC ONCE /ST $start /TN $task /TR "$tr" /RU "NT AUTHORITY\SYSTEM" | Out-Null
-          schtasks /Run /TN $task | Out-Null
-          Write-Host "🚀 Registration task launched as SYSTEM."
-
-          # Poll scheduled task + tail wrapper log; up to ~4 minutes
-          $ok = $false
-          $attempts = 48
-          for ($i=1; $i -le $attempts; $i++) {
-            Start-Sleep -Seconds 5
-
-            if (Test-Path $logPath) {
-              Write-Host "—— CRD wrapper log snapshot ——"
-              Get-Content $logPath -ErrorAction SilentlyContinue | Select-Object -Last 15
-              Write-Host "——————————————"
-            }
-
-            $q = schtasks /Query /TN $task /V /FO LIST | Out-String
-            $last = ($q | Select-String -Pattern "Last Task Result:\s*(.+)$").Matches.Value
-            $status = ($q | Select-String -Pattern "Status:\s*(.+)$").Matches.Value
-            if ($last) {
-              # Show parsed status/result to logs
-              Write-Host ("[TaskStatus] " + ($status -replace 'Status:\s*','') + " | [LastResult] " + ($last -replace 'Last Task Result:\s*',''))
-            }
-
-            $hostPaths = @(
-              "C:\ProgramData\Google\Chrome Remote Desktop\host.json",
-              "C:\ProgramData\Google\Chrome Remote Desktop\host_unprivileged.json"
-            ) | Where-Object { Test-Path $_ }
-
-            if ($hostPaths.Count -gt 0) { $ok = $true; break }
+          $ErrorActionPreference = "Stop"
+          # Google’s recommended Windows/Server settings for CRD hosts
+          reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f
+          # Restart CRD host service if present
+          sc.exe query chromoting > $null 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            net stop chromoting
+            net start chromoting
           }
 
-          if ($ok) { Write-Host "✅ CRD host registered (host file present)." }
-          else { Write-Host "⚠️ Host files not detected; most often this means the OAuth code was expired/used. Generate a fresh code and re-run." }
-
-          # Try to start likely service names (depends on host build)
-          foreach($svcName in @("chromoting","ChromeRemoteDesktopService","chromeremotedesktopservice")){
-            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -ne "Running") { try { Start-Service -Name $svcName } catch {} }
-          }
-
-          # Keep task artifacts for inspection, but remove the task
-          schtasks /Delete /F /TN $task | Out-Null
-
-      # 5) Final Summary (username, password, PIN)
-      - name: "🧾 Connection Summary"
+      - name: Build CRD start-host command (from full command OR from code)
         shell: pwsh
         run: |
-          $user = $env:TARGET_USER
-          $pass = $env:TARGET_PASS
-          $pin  = $env:GCRD_PIN
-          $pinMasked = if ($pin.Length -gt 2) { ('*' * ($pin.Length-2)) + $pin.Substring($pin.Length-2) } else { $pin }
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## ✅ EnigMano Remote Access Ready"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- **Computer Name** : " + $env:COMPUTERNAME)
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- **RDP Enabled**   : Yes (firewall opened)")
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- **User**          : " + $user)
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- **Password**      : " + $pass)
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- **CRD Access**    : https://remotedesktop.google.com/access")
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- **CRD PIN**       : " + $pinMasked)
-          Write-Host ("🔑 Credentials -> User=" + $user + " | Pass=" + $pass + " | PIN=" + $pinMasked)
+          $ErrorActionPreference = "Stop"
+          $exe = "$env:CRD_START_HOST"
+          $name = "$env:HOST_NAME"
+
+          function Extract-Code([string]$s) {
+            if ($s -match 'code="?([0-9A-Za-z\/\-_]+)"?') { return $Matches[1] }
+            if ($s -match '(^|[^A-Za-z0-9\/])(?<code>4\/[0-9A-Za-z\-_]+)($|[^A-Za-z0-9\-_])') { return $Matches['code'] }
+            return $null
+          }
+
+          $code = Extract-Code $env:SETUP_INPUT
+          if (-not $code) {
+            throw @"
+No OAuth code detected.
+From https://remotedesktop.google.com/ (Set up via SSH), copy either:
+  • the entire Windows command containing --code=..., OR
+  • just the OAuth code that starts with '4/'.
+"@
+          }
+
+          $pin = $env:PIN
+          if ($pin.Length -lt 6) { throw "GCRD_PIN must be at least 6 digits." }
+          if ($pin -notmatch '^\d{6,}$') { throw "GCRD_PIN must contain digits only." }
+
+          $args = @(
+            "--code=""$code"""
+            "--redirect-url=""$env:REDIRECT_URL"""
+            "--name=""$name"""
+            "--pin=""$pin"""
+          ) -join " "
+
+          # Mask sensitive tokens in logs
+          Write-Output "::add-mask::$code"
+          Write-Output "::add-mask::$pin"
+
+          echo "CRD_ARGS=$args" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "CRD_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Register CRD host AS the target account (loads user profile)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sec = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential ("$env:COMPUTERNAME\$env:TARGET_USER", $sec)
+          Write-Host "Launching as $($env:TARGET_USER) ..."
+          Start-Process -FilePath "$env:CRD_START_HOST" `
+                        -ArgumentList $env:CRD_ARGS `
+                        -Credential $cred `
+                        -LoadUserProfile `
+                        -Wait
+
+      - name: Verify CRD & system status
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "=== Services ==="
+          Get-Service chromoting,TermService | Format-Table -Auto
+          Write-Host "`n=== Host entry ==="
+          $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
+          if (Test-Path $log) { Get-Content $log -Tail 50 }
+          Write-Host "`n=== Whoami / Groups ==="
+          whoami /all
+
+      - name: Show connection instructions + keep alive
+        shell: pwsh
+        run: |
+          Write-Host "====================================================="
+          Write-Host " ✅ Chrome Remote Desktop registration attempted."
+          Write-Host "    Name: $env:CRD_NAME"
+          Write-Host "    Sign into the SAME Google account used to create the code,"
+          Write-Host "    then open: https://remotedesktop.google.com/access"
+          Write-Host "    Your host should appear as: $env:CRD_NAME"
+          Write-Host "-----------------------------------------------------"
+          Write-Host "Note: RDP service is enabled locally, but GitHub-hosted"
+          Write-Host "runners do not accept inbound connections from the internet."
+          Write-Host "Use Chrome Remote Desktop for access."
+          Write-Host "====================================================="
+          Start-Sleep -Seconds (60 * [int]$env:TTL_MIN)
