@@ -8,7 +8,7 @@ on:
         required: true
         default: "1"
       SETUP_CMD_OR_CODE:
-        description: "Paste the full 'Setup via SSH' command OR just the OAuth code starting with 4/"
+        description: "Paste the full 'Set up via SSH' command OR just the OAuth code starting with 4/"
         required: true
         default: ""
       GCRD_PIN:
@@ -44,7 +44,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     env:
-      # Pass inputs through env to avoid PowerShell parsing issues with %...%
+      # Pass inputs via env to avoid PowerShell parsing issues (e.g., %PROGRAMFILES(X86)%)
       INSTANCE: ${{ inputs.INSTANCE }}
       RAW_SETUP: ${{ inputs.SETUP_CMD_OR_CODE }}
       RAW_PIN: ${{ inputs.GCRD_PIN }}
@@ -52,11 +52,10 @@ jobs:
       RAW_NEW_PASSWORD: ${{ inputs.NEW_PASSWORD }}
       RAW_REDIRECT_URL: ${{ inputs.GCRD_REDIRECT_URL }}
       RAW_TTL: ${{ inputs.TTL_MINUTES }}
-
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
 
     steps:
-      - name: Normalize inputs + derive defaults (safe masking)
+      - name: Normalize inputs + derive defaults (masking)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -112,7 +111,10 @@ jobs:
 
           if ($env:TARGET_USER -eq "runneradmin") {
             net user runneradmin "$env:TARGET_PASS"
-            # OPTIONAL: Avoid global policy changes; we skip password-expiry fiddling.
+            # Optional: avoid password expiration using LocalAccounts if available
+            if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+              try { Set-LocalUser -Name "runneradmin" -PasswordNeverExpires $true } catch {}
+            }
           } else {
             if (-not (Get-LocalUser -Name $env:TARGET_USER -ErrorAction SilentlyContinue)) {
               net user $env:TARGET_USER "$env:TARGET_PASS" /add
@@ -120,6 +122,9 @@ jobs:
               net user $env:TARGET_USER "$env:TARGET_PASS"
             }
             net localgroup Administrators $env:TARGET_USER /add
+            if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+              try { Set-LocalUser -Name $env:TARGET_USER -PasswordNeverExpires $true } catch {}
+            }
           }
 
       - name: Enable RDP & firewall (completeness)
@@ -143,7 +148,7 @@ jobs:
           if (-not (Test-Path $exe)) { throw "remoting_start_host.exe not found at: $exe" }
           "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Apply CRD stability policies and restart service
+      - name: Apply CRD stability policies (no early restart)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -151,11 +156,11 @@ jobs:
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f
-          # Restart CRD service if present (service name 'chromoting')
+          # Set service to auto-start if present; do NOT force start yet
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
-          if ($svc) { Stop-Service chromoting -Force; Start-Service chromoting }
+          if ($svc) { sc.exe config chromoting start= auto | Out-Null }
 
-      - name: Build CRD start-host command (from full command OR from code)
+      - name: Build CRD args (from full command OR from code)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -182,44 +187,74 @@ jobs:
             "--pin=""$pin"""
           ) -join " "
 
-          # Mask sensitive tokens
           Write-Output "::add-mask::$code"
           Write-Output "::add-mask::$pin"
 
           "CRD_ARGS=$args" | Out-File -FilePath $env:GITHUB_ENV -Append
           "CRD_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Register CRD host AS the target account (loads user profile)
+      - name: Register CRD host as target user via Scheduled Task (reliable, elevated)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $sec = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ("$env:COMPUTERNAME\$env:TARGET_USER", $sec)
-          Write-Host "Launching CRD as $($env:TARGET_USER) ..."
-          Start-Process -FilePath "$env:CRD_START_HOST" `
-                        -ArgumentList $env:CRD_ARGS `
-                        -Credential $cred `
-                        -LoadUserProfile `
-                        -Wait
 
-      - name: Verify CRD & system status
+          $exe  = "$env:CRD_START_HOST"
+          $args = "$env:CRD_ARGS"
+          $task = "CRD-Register-$($env:HOST_NAME)"
+          $cmd  = Join-Path $env:TEMP "crd_register.cmd"
+
+          # Write a tiny wrapper script to avoid any quoting surprises
+          "@echo off`r`n""$exe"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
+
+          # Create one-shot task with highest privileges under the target user, then run immediately
+          schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st 00:00 /RL HIGHEST /RU "$env:COMPUTERNAME\$env:TARGET_USER" /RP "$env:TARGET_PASS" /F | Out-Null
+          schtasks /run /tn "$task" | Out-Null
+
+          # Wait a bit for registration to complete
+          Start-Sleep -Seconds 10
+
+      - name: Post-registration: start CRD service with retries (don’t fail early)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"   # Do not fail the job here if service start struggles
+          function TryStart($name) {
+            $s = Get-Service -Name $name -ErrorAction SilentlyContinue
+            if ($s) {
+              sc.exe config $name start= auto | Out-Null
+              for ($i=0; $i -lt 6; $i++) {
+                try { Start-Service $name -ErrorAction Stop } catch { Start-Sleep -Seconds 5; continue }
+                $s = Get-Service -Name $name -ErrorAction SilentlyContinue
+                if ($s.Status -eq 'Running') { return $true }
+                Start-Sleep -Seconds 5
+              }
+            }
+            return $false
+          }
+
+          $ok = TryStart "chromoting"
+          if (-not $ok) {
+            # Some images register service with display name only — try by display name lookup
+            $svc = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
+            if ($svc) {
+              TryStart $svc.Name | Out-Null
+            }
+          }
+
+          Write-Host "CRD service status (if present):"
+          Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
+          Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue | Format-Table -Auto
+
+      - name: Verify & tail logs
         shell: pwsh
         continue-on-error: true
         run: |
-          Write-Host "=== Services ==="
-          Get-Service TermService -ErrorAction SilentlyContinue | Format-Table -Auto
-          $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
-          if (-not $svc) {
-            $svc = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
-          }
-          if ($svc) { $svc | Format-Table -Auto }
-          Write-Host "`n=== Host log (tail) ==="
+          Write-Host "=== Host log (tail) ==="
           $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
-          if (Test-Path $log) { Get-Content $log -Tail 100 }
+          if (Test-Path $log) { Get-Content $log -Tail 150 }
           Write-Host "`n=== Whoami / Groups ==="
           whoami /all
 
-      - name: Show connection instructions + keep alive
+      - name: Connect instructions + keep alive
         shell: pwsh
         run: |
           Write-Host "====================================================="
