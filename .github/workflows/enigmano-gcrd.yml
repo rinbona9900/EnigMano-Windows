@@ -44,7 +44,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     env:
-      # Pass inputs via env to avoid PowerShell parsing issues (e.g., %PROGRAMFILES(X86)%)
       INSTANCE: ${{ inputs.INSTANCE }}
       RAW_SETUP: ${{ inputs.SETUP_CMD_OR_CODE }}
       RAW_PIN: ${{ inputs.GCRD_PIN }}
@@ -68,11 +67,11 @@ jobs:
           $pinInput     = ($env:RAW_PIN          | ForEach-Object { $_.Trim() })
           $ttlStr       = ($env:RAW_TTL          | ForEach-Object { $_.Trim() })
 
-          if (-not [int]::TryParse($ttlStr, [ref]0)) { $ttlStr = "120" }
+          $out = 0
+          if (-not [int]::TryParse($ttlStr, [ref]$out)) { $ttlStr = "120" }
           $ttl = [int]$ttlStr
           if ($ttl -lt 10) { $ttl = 10 }
 
-          # Auto-PIN (12 digits) if blank
           if ([string]::IsNullOrWhiteSpace($pinInput)) {
             $seed = "EnigMano$instance"
             $sha  = [System.Security.Cryptography.SHA256]::Create()
@@ -80,7 +79,6 @@ jobs:
             $pinInput = (($sha.ComputeHash($buf) | ForEach-Object { $_ % 10 }) -join '').Substring(0,12)
           }
 
-          # Choose / validate target account
           if ([string]::IsNullOrWhiteSpace($newUser)) {
             $targetUser = "runneradmin"
             $targetPass = if ([string]::IsNullOrWhiteSpace($newPass)) { "Enigman0" } else { $newPass }
@@ -90,8 +88,9 @@ jobs:
             $targetPass = $newPass
           }
 
-          # Mask sensitive values in logs
-          @($targetPass, $pinInput) | ForEach-Object { if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" } }
+          @($targetPass, $pinInput) | ForEach-Object {
+            if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" }
+          }
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { Write-Output "::add-mask::$($Matches[1])" }
           if ($setupInput -match '4\/[0-9A-Za-z\-_]+')        { Write-Output "::add-mask::$($Matches[0])" }
 
@@ -111,7 +110,6 @@ jobs:
 
           if ($env:TARGET_USER -eq "runneradmin") {
             net user runneradmin "$env:TARGET_PASS"
-            # Optional: avoid password expiration using LocalAccounts if available
             if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
               try { Set-LocalUser -Name "runneradmin" -PasswordNeverExpires $true } catch {}
             }
@@ -131,7 +129,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # RDP enabled locally; GH-hosted runners still won't accept public inbound.
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
@@ -156,7 +153,6 @@ jobs:
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f
-          # Set service to auto-start if present; do NOT force start yet
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
 
@@ -167,7 +163,6 @@ jobs:
           $name = "$env:HOST_NAME"
           $inputText = "$env:SETUP_INPUT"
 
-          # Extract OAuth code from either full command or standalone code (4/...)
           $code = $null
           if ($inputText -match 'code="?([0-9A-Za-z\/\-_]+)"?') { $code = $Matches[1] }
           elseif ($inputText -match '(4\/[0-9A-Za-z\-_]+)')     { $code = $Matches[1] }
@@ -203,20 +198,20 @@ jobs:
           $task = "CRD-Register-$($env:HOST_NAME)"
           $cmd  = Join-Path $env:TEMP "crd_register.cmd"
 
-          # Write a tiny wrapper script to avoid any quoting surprises
-          "@echo off`r`n""$exe"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
+          $content = "@echo off`r`n"
+          $content += "`"$exe`" $args`r`n"
+          $content += "exit /b %errorlevel%`r`n"
+          Set-Content -Path $cmd -Value $content -Encoding ASCII -Force
 
-          # Create one-shot task with highest privileges under the target user, then run immediately
           schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st 00:00 /RL HIGHEST /RU "$env:COMPUTERNAME\$env:TARGET_USER" /RP "$env:TARGET_PASS" /F | Out-Null
           schtasks /run /tn "$task" | Out-Null
 
-          # Wait a bit for registration to complete
           Start-Sleep -Seconds 10
 
-      - name: Post-registration: start CRD service with retries (don’t fail early)
+      - name: Post-registration: start CRD service with retries
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"   # Do not fail the job here if service start struggles
+          $ErrorActionPreference = "Continue"
           function TryStart($name) {
             $s = Get-Service -Name $name -ErrorAction SilentlyContinue
             if ($s) {
@@ -233,11 +228,8 @@ jobs:
 
           $ok = TryStart "chromoting"
           if (-not $ok) {
-            # Some images register service with display name only — try by display name lookup
             $svc = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
-            if ($svc) {
-              TryStart $svc.Name | Out-Null
-            }
+            if ($svc) { TryStart $svc.Name | Out-Null }
           }
 
           Write-Host "CRD service status (if present):"
