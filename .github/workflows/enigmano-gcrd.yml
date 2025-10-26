@@ -68,7 +68,7 @@ jobs:
       - name: 🧩 Install Chrome Remote Desktop Host
         shell: pwsh
         run: |
-          $url = "https://dl.google.com/dl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $url = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
           $msi = Join-Path $env:TEMP "crdhost.msi"
           Write-Host "🌐 Downloading Chrome Remote Desktop Host MSI..."
           Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
