@@ -115,7 +115,7 @@ jobs:
 
           Write-Host "✅ Normalized: User=$user | Redirect=$redirect | PIN=(hidden)"
 
-      # 2) GCRD one-step: ensure admin → install → register via elevated Scheduled Task (wrapper) → verify (with logs)
+      # 2) GCRD one-step: ensure admin → install → register via elevated Scheduled Task (wrapper) → verify (with rich logs)
       - name: "🔐 Install & Register Chrome Remote Desktop (one-step)"
         shell: pwsh
         run: |
@@ -124,13 +124,12 @@ jobs:
           # Ensure local admin
           $secure = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
           $exists = Get-LocalUser -Name $env:TARGET_USER -ErrorAction SilentlyContinue
-          if ($exists) { Set-LocalUser -Name $env:TARGET_USER -Password $secure }
-          else { New-LocalUser -Name $env:TARGET_USER -Password $secure -FullName $env:TARGET_USER -Description "EnigMano Admin" | Out-Null }
+          if ($exists) { Set-LocalUser -Name $env:TARGET_USER -Password $secure } else { New-LocalUser -Name $env:TARGET_USER -Password $secure -FullName $env:TARGET_USER -Description "EnigMano Admin" | Out-Null }
           try { Add-LocalGroupMember -Group "Administrators" -Member $env:TARGET_USER -ErrorAction SilentlyContinue } catch {}
           & net user $env:TARGET_USER /active:yes | Out-Null
           Write-Host "👑 Admin ensured: $env:TARGET_USER"
 
-          # Install CRD
+          # Install CRD Host
           $url = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
           Write-Host "⬇️  Downloading CRD Host MSI..."
@@ -147,19 +146,22 @@ jobs:
           if (-not $exe) { Fail "remoting_start_host.exe not found." }
           Write-Host "🛤️  CRD path: $exe"
 
-          # Write wrapper (with logging) to bypass schtasks /TR limit
+          # Write wrapper (with rich logging) to bypass schtasks /TR length
           $wrapper = Join-Path $env:WINDIR "Temp\enigmano-crd-register.ps1"
           $logPath = Join-Path $env:WINDIR "Temp\enigmano-crd-register.log"
-          $line1 = '$ErrorActionPreference = "Continue"'
-          $line2 = '$exe = "' + $exe.Replace('"','\"') + '"'
-          $line3 = '$args = @("--code=""' + $env:GCRD_CODE.Replace('"','\"') + '""","--redirect-url=""' + $env:GCRD_REDIRECT.Replace('"','\"') + '""","--name="+$env:COMPUTERNAME,"--pin=' + $env:GCRD_PIN + '")'
-          $line4 = 'try {'
-          $line5 = '  $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden'
-          $line6 = '  "[CRD] ExitCode=" + $p.ExitCode | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
-          $line7 = '} catch { "[CRD-ERR] " + $_ | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append }'
-          $line8 = 'Get-ChildItem "C:\ProgramData\Google\Chrome Remote Desktop" -ErrorAction SilentlyContinue | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
-          $line9 = 'exit 0'
-          Set-Content -Path $wrapper -Value @($line1,$line2,$line3,$line4,$line5,$line6,$line7,$line8,$line9) -Encoding ASCII
+          $ts = 'function TS{Get-Date -Format "yyyy-MM-dd HH:mm:ss"}'
+          $l1 = $ts
+          $l2 = '$ErrorActionPreference = "Continue"'
+          $l3 = '$exe = "' + $exe.Replace('"','\"') + '"'
+          $l4 = '$args = @("--code=""' + $env:GCRD_CODE.Replace('"','\"') + '""","--redirect-url=""' + $env:GCRD_REDIRECT.Replace('"','\"') + '""","--name="+$env:COMPUTERNAME,"--pin=' + $env:GCRD_PIN + '")'
+          $l5 = '("[{0}] Starting registration..." -f (TS)) | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
+          $l6 = 'try {'
+          $l7 = '  $p = Start-Process -FilePath $exe -ArgumentList $args -RedirectStandardOutput "' + $logPath + '" -RedirectStandardError "' + $logPath + '" -NoNewWindow -PassThru -Wait'
+          $l8 = '  ("[{0}] ExitCode=" + $p.ExitCode -f (TS)) | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
+          $l9 = '} catch { ("[{0}] ERROR: " + $_ | Out-String) -f (TS) | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append }'
+          $lA = 'Get-ChildItem "C:\ProgramData\Google\Chrome Remote Desktop" -ErrorAction SilentlyContinue | Out-File -FilePath "' + $logPath + '" -Encoding utf8 -Append'
+          $lB = 'exit 0'
+          Set-Content -Path $wrapper -Value @($l1,$l2,$l3,$l4,$l5,$l6,$l7,$l8,$l9,$lA,$lB) -Encoding ASCII
           Write-Host "🧩 Wrapper created: $wrapper"
 
           # Create elevated Scheduled Task to run wrapper as target admin
@@ -170,24 +172,38 @@ jobs:
           schtasks /Run /TN $task | Out-Null
           Write-Host "🚀 CRD registration task launched as $env:TARGET_USER."
 
-          # Allowlist firewall (extra safety)
-          try {
-            New-NetFirewallRule -DisplayName "Chrome Remote Desktop Host" -Direction Outbound -Program $exe -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
-          } catch {}
+          # Firewall allow (defensive)
+          try { New-NetFirewallRule -DisplayName "Chrome Remote Desktop Host" -Direction Outbound -Program $exe -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null } catch {}
 
-          # Wait up to ~3 minutes for host to register; show wrapper logs if present
+          # Helper to check service
+          function Ensure-Service{
+            param([string]$n)
+            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+            if ($s -and $s.Status -ne "Running") { try { Start-Service -Name $n } catch {} }
+          }
+
+          # Wait up to ~3 minutes for host to register; show wrapper logs and retry once if exit looks bad
           $ok = $false
+          $retried = $false
           for ($i=1; $i -le 36; $i++) {
             Start-Sleep -Seconds 5
 
+            Ensure-Service "chromoting"
+            Ensure-Service "ChromeRemoteDesktopService"
+
             if (Test-Path $logPath) {
               Write-Host "—— CRD wrapper log snapshot ——"
-              Get-Content $logPath -ErrorAction SilentlyContinue | Select-Object -Last 10
+              Get-Content $logPath -ErrorAction SilentlyContinue | Select-Object -Last 15
               Write-Host "——————————————"
-            }
 
-            $svc = Get-Service -Name "chromoting" -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -ne "Running") { try { Start-Service -Name "chromoting" } catch {} }
+              # If we clearly see ExitCode=1 and haven't retried yet, retry once
+              $tail = (Get-Content $logPath -ErrorAction SilentlyContinue | Select-Object -Last 5) -join " "
+              if (-not $retried -and ($tail -match 'ExitCode=1')) {
+                $retried = $true
+                Write-Host "♻️  Retrying registration once..."
+                schtasks /Run /TN $task | Out-Null
+              }
+            }
 
             $hostPaths = @(
               "C:\ProgramData\Google\Chrome Remote Desktop\host.json",
@@ -198,7 +214,7 @@ jobs:
           }
 
           if ($ok) { Write-Host "✅ CRD host registered (host file present)." }
-          else { Write-Host "⚠️  Host files not detected; check https://remotedesktop.google.com/access and ensure the OAuth code is still valid." }
+          else { Write-Host "⚠️  Host files not detected; most often this means the OAuth code was expired/used. Generate a fresh code and re-run." }
 
           # Cleanup task (keep wrapper/log for inspection)
           schtasks /Delete /F /TN $task | Out-Null
