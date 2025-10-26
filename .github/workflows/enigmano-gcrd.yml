@@ -54,7 +54,7 @@ jobs:
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
 
     steps:
-      - name: Normalize inputs + derive defaults (masking)
+      - name: "Normalize inputs + derive defaults (masking)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -103,7 +103,7 @@ jobs:
           "TTL_MIN=$ttl"                                              | Out-File -FilePath $env:GITHUB_ENV -Append
           "HOST_NAME=EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"    | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Ensure target account exists and is admin (no WMIC)
+      - name: "Ensure target account exists and is admin (no WMIC)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -125,7 +125,7 @@ jobs:
             }
           }
 
-      - name: Enable RDP & firewall (completeness)
+      - name: "Enable RDP & firewall (completeness)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -134,18 +134,19 @@ jobs:
           Set-Service -Name TermService -StartupType Automatic
           Start-Service TermService
 
-      - name: Download & install Chrome Remote Desktop Host (silent)
+      - name: "Download & install Chrome Remote Desktop Host (silent)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
           Invoke-WebRequest -Uri "$env:MSI_URL" -OutFile $msi
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
-          $exe = "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $exe = Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe'
           if (-not (Test-Path $exe)) { throw "remoting_start_host.exe not found at: $exe" }
           "CRD_START_HOST=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Apply CRD stability policies (no early restart)
+      - name: "Apply CRD stability policies (no early restart)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -156,7 +157,7 @@ jobs:
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
 
-      - name: Build CRD args (from full command OR from code)
+      - name: "Build CRD args (from full command OR from code)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -188,7 +189,7 @@ jobs:
           "CRD_ARGS=$args" | Out-File -FilePath $env:GITHUB_ENV -Append
           "CRD_NAME=$name"  | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Register CRD host as target user via Scheduled Task (reliable, elevated)
+      - name: "Register CRD host as target user via Scheduled Task (reliable, elevated)"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -208,11 +209,11 @@ jobs:
 
           Start-Sleep -Seconds 10
 
-      - name: Post-registration: start CRD service with retries
+      - name: "Post-registration: start CRD service with retries"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          function TryStart($name) {
+          function TryStart([string]$name) {
             $s = Get-Service -Name $name -ErrorAction SilentlyContinue
             if ($s) {
               sc.exe config $name start= auto | Out-Null
@@ -229,14 +230,14 @@ jobs:
           $ok = TryStart "chromoting"
           if (-not $ok) {
             $svc = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
-            if ($svc) { TryStart $svc.Name | Out-Null }
+            if ($svc) { [void](TryStart $svc.Name) }
           }
 
           Write-Host "CRD service status (if present):"
           Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
           Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue | Format-Table -Auto
 
-      - name: Verify & tail logs
+      - name: "Verify & tail logs"
         shell: pwsh
         continue-on-error: true
         run: |
@@ -246,7 +247,7 @@ jobs:
           Write-Host "`n=== Whoami / Groups ==="
           whoami /all
 
-      - name: Connect instructions + keep alive
+      - name: "Connect instructions + keep alive"
         shell: pwsh
         run: |
           Write-Host "====================================================="
