@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows — Magical v4 (AutoLogon+)"
+name: "⚡ EnigMano GCRD Windows — Magical v5 (AutoLogon • Hide runneradmin)"
 
 on:
   workflow_dispatch:
@@ -52,7 +52,7 @@ jobs:
       MSI_URL:             https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
 
     steps:
-      - name: "Create user → hide others → autologon → preload profile → CRD → resolution"
+      - name: "Create user → hide others (keep runneradmin) → autologon → preload profile → CRD → resolution"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -77,7 +77,7 @@ jobs:
           "TTL_MIN=$ttl"       | Out-File -FilePath $env:GITHUB_ENV -Append
           "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # ---------- 0) Services that help with secondary logon ----------
+          # ---------- Prep: ensure Secondary Logon service ----------
           Set-Service -Name seclogon -StartupType Automatic
           try { Start-Service -Name seclogon } catch {}
           Start-Sleep -Seconds 2
@@ -96,32 +96,37 @@ jobs:
           }
           Start-Sleep -Seconds 1
 
-          # ---------- 2) Hide & disable ALL other local users (after user creation) ----------
+          # ---------- 2) Hide other users from Welcome screen (do NOT disable runneradmin) ----------
           $hideKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
           reg add "$hideKey" /f | Out-Null
           Get-LocalUser | ForEach-Object {
             $name = $_.Name
             if ($name -ne $TargetUser) {
-              try { net user $name "$DefaultPass" | Out-Null } catch {}
-              try { Disable-LocalUser -Name $name -ErrorAction SilentlyContinue } catch {}
               try { reg add "$hideKey" /v "$name" /t REG_DWORD /d 0 /f | Out-Null } catch {}
+            } else {
+              try { reg delete "$hideKey" /v "$name" /f | Out-Null } catch {}
             }
           }
+          # Ensure runneradmin stays enabled; do not sign it out.
+          try {
+            $ra = Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
+            if ($ra -and -not $ra.Enabled) { Enable-LocalUser -Name "runneradmin" }
+          } catch {}
           Start-Sleep -Seconds 2
 
-          # ---------- 3) AutoAdminLogon to the new user (and tidy sign-in UI) ----------
+          # ---------- 3) AutoAdminLogon to the new user ----------
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           & reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           & reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
           & reg add "$wl" /v DefaultUserName   /t REG_SZ    /d "$TargetUser"  /f | Out-Null
           & reg add "$wl" /v DefaultDomainName /t REG_SZ    /d "$env:COMPUTERNAME" /f | Out-Null
           & reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
+          # Tidy sign-in UI
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DontDisplayLastUsername /t REG_DWORD /d 1 /f | Out-Null
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v HideFastUserSwitching  /t REG_DWORD /d 1 /f | Out-Null
           Start-Sleep -Seconds 2
 
-          # ---------- 3a) Preload the new user's profile & create a real logon session ----------
-          # Use Start-Process -Credential to create a user logon and load profile (non-interactive is fine)
+          # ---------- 3a) Materialize a real logon session for the new user (without touching runneradmin) ----------
           $sec = ConvertTo-SecureString $DefaultPass -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$TargetUser",$sec)
           try {
@@ -129,7 +134,7 @@ jobs:
           } catch {}
           Start-Sleep -Seconds 3
 
-          # Warmup scheduled task as an additional guarantee & to keep session warm
+          # Warmup scheduled task under the new user (keeps profile mounted)
           $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
           $warmTask = "CRD-ProfileWarmup-$CRD_NAME"
           $cmd2 = Join-Path $env:TEMP "warmup_$TargetUser.cmd"
@@ -141,7 +146,7 @@ jobs:
           schtasks /run /tn "$warmTask" | Out-Null
           Start-Sleep -Seconds 5
 
-          # Verify HKU\<SID> is mounted (indicates profile/logon context)
+          # Verify HKU\<SID> is mounted (indicates active logon token)
           $mounted = $false
           for ($i=0; $i -lt 30; $i++) {
             if (Test-Path "Registry::HKEY_USERS\$sid") { $mounted = $true; break }
@@ -170,13 +175,13 @@ jobs:
           }
           if (-not (Test-Path $CRD_EXE)) { throw "remoting_start_host.exe not found at: $CRD_EXE" }
 
-          # Hardening & service setup
+          # CRD hardening (curtain) + service
           reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f | Out-Null
           $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
           Start-Sleep -Seconds 2
 
-          # ---------- Parse OAuth code (more permissive) ----------
+          # ---------- Parse OAuth code (permissive) ----------
           $code = $null
           if     ($setupInput -match 'code="?([^"\s]+)"?') { $code = $Matches[1] }
           elseif ($setupInput -match '(4\/[\w\-\.\~]+)')   { $code = $Matches[1] }
@@ -195,7 +200,6 @@ jobs:
           $cmd  = Join-Path $env:TEMP "crd_register_$TargetUser.cmd"
           "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
 
-          # Start time ~2 minutes ahead to avoid SCHTASKS time validation errors
           $st2 = (Get-Date).AddMinutes(2).ToString('HH:mm')
           schtasks /delete /tn "$task" /f | Out-Null 2>$null
           schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st $st2 /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
@@ -203,14 +207,27 @@ jobs:
           schtasks /run /tn "$task" | Out-Null
           Start-Sleep -Seconds 10
 
-          # ---------- 5) Ensure per-user DPI (100%) + default headless resolution ----------
+          # ---------- Per-user DPI + keep-awake (avoid session-ended) ----------
           if ($mounted) {
+            # DPI 100%
             reg add "HKU\$sid\Control Panel\Desktop" /v LogPixels /t REG_DWORD /d 96 /f | Out-Null
             reg add "HKU\$sid\Control Panel\Desktop" /v Win8DpiScaling /t REG_DWORD /d 0  /f | Out-Null
+            # No screensaver / no lock on idle
+            reg add "HKU\$sid\Control Panel\Desktop" /v ScreenSaveActive     /t REG_SZ    /d 0 /f | Out-Null
+            reg add "HKU\$sid\Control Panel\Desktop" /v ScreenSaverIsSecure  /t REG_SZ    /d 0 /f | Out-Null
+            reg add "HKU\$sid\Control Panel\Desktop" /v ScreenSaveTimeOut    /t REG_SZ    /d 0 /f | Out-Null
             # Apply per-user desktop params (best-effort)
             try { & rundll32.exe user32.dll,UpdatePerUserSystemParameters } catch {}
           }
 
+          # System power: never sleep/turn off display (AC)
+          try {
+            powercfg -change -monitor-timeout-ac 0
+            powercfg -change -standby-timeout-ac 0
+            powercfg -change -disk-timeout-ac 0
+          } catch {}
+
+          # ---------- System headless resolution (W×H) ----------
           function Set-HeadlessRes {
             param([int]$W = 1920, [int]$H = 1080)
             $gfxRoot = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
@@ -283,8 +300,9 @@ jobs:
           $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
           if (Test-Path $log) { Get-Content $log -Tail 150 }
 
-          Write-Host "`n=== Accounts (post-enforcement) ==="
+          Write-Host "`n=== Accounts (visibility) ==="
           Get-LocalUser | Select-Object Name,Enabled | Format-Table -Auto
+          Write-Host "(runneradmin remains enabled but hidden on the Welcome screen.)"
 
           Write-Host "`n=== AutoAdminLogon Target ==="
           Write-Host "Will auto-logon as: $TargetUser"
@@ -303,9 +321,10 @@ jobs:
           Write-Host "    then open: https://remotedesktop.google.com/access"
           Write-Host "    Your host should appear as: $env:CRD_NAME"
           Write-Host "-----------------------------------------------------"
-          Write-Host "New user created, others hidden/disabled."
-          Write-Host "AutoAdminLogon set to the new user; session preloaded and kept warm."
-          Write-Host "Headless display set to $env:DISP_W x $env:DISP_H; DPI set to 100% for the target user."
+          Write-Host "New user created and set as AutoAdminLogon."
+          Write-Host "runneradmin stays enabled but hidden from the user list."
+          Write-Host "Per-user DPI=100%, headless display set to $env:DISP_W x $env:DISP_H."
+          Write-Host "Power/lock disabled to avoid session drops."
           Write-Host "Note: RDP is enabled locally for completeness, but GitHub-hosted"
           Write-Host "runners do not accept inbound connections from the internet."
           Write-Host "Use Chrome Remote Desktop for access."
