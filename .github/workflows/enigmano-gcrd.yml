@@ -44,7 +44,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     env:
-      # Move all user inputs into environment variables to avoid PowerShell parsing issues
+      # Pass inputs through env to avoid PowerShell parsing issues with %...%
       INSTANCE: ${{ inputs.INSTANCE }}
       RAW_SETUP: ${{ inputs.SETUP_CMD_OR_CODE }}
       RAW_PIN: ${{ inputs.GCRD_PIN }}
@@ -54,24 +54,26 @@ jobs:
       RAW_TTL: ${{ inputs.TTL_MINUTES }}
 
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
+
     steps:
       - name: Normalize inputs + derive defaults (safe masking)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $instance     = ($env:INSTANCE   | ForEach-Object { $_.Trim() })
-          $setupInput   = ($env:RAW_SETUP  | ForEach-Object { $_.Trim() })
+          $instance     = ($env:INSTANCE         | ForEach-Object { $_.Trim() })
+          $setupInput   = ($env:RAW_SETUP        | ForEach-Object { $_.Trim() })
           $redirectUrl  = ($env:RAW_REDIRECT_URL | ForEach-Object { $_.Trim() })
           $newUser      = ($env:RAW_NEW_USERNAME | ForEach-Object { $_.Trim() })
           $newPass      = ($env:RAW_NEW_PASSWORD | ForEach-Object { $_.Trim() })
-          $pinInput     = ($env:RAW_PIN    | ForEach-Object { $_.Trim() })
-          $ttlStr       = ($env:RAW_TTL    | ForEach-Object { $_.Trim() })
+          $pinInput     = ($env:RAW_PIN          | ForEach-Object { $_.Trim() })
+          $ttlStr       = ($env:RAW_TTL          | ForEach-Object { $_.Trim() })
 
           if (-not [int]::TryParse($ttlStr, [ref]0)) { $ttlStr = "120" }
           $ttl = [int]$ttlStr
           if ($ttl -lt 10) { $ttl = 10 }
 
+          # Auto-PIN (12 digits) if blank
           if ([string]::IsNullOrWhiteSpace($pinInput)) {
             $seed = "EnigMano$instance"
             $sha  = [System.Security.Cryptography.SHA256]::Create()
@@ -79,6 +81,7 @@ jobs:
             $pinInput = (($sha.ComputeHash($buf) | ForEach-Object { $_ % 10 }) -join '').Substring(0,12)
           }
 
+          # Choose / validate target account
           if ([string]::IsNullOrWhiteSpace($newUser)) {
             $targetUser = "runneradmin"
             $targetPass = if ([string]::IsNullOrWhiteSpace($newPass)) { "Enigman0" } else { $newPass }
@@ -88,7 +91,7 @@ jobs:
             $targetPass = $newPass
           }
 
-          # Mask sensitive values
+          # Mask sensitive values in logs
           @($targetPass, $pinInput) | ForEach-Object { if ($_ -and $_.Length -gt 0) { Write-Output "::add-mask::$_" } }
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-_]+)"?') { Write-Output "::add-mask::$($Matches[1])" }
           if ($setupInput -match '4\/[0-9A-Za-z\-_]+')        { Write-Output "::add-mask::$($Matches[0])" }
@@ -102,14 +105,14 @@ jobs:
           "TTL_MIN=$ttl"                                              | Out-File -FilePath $env:GITHUB_ENV -Append
           "HOST_NAME=EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"    | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Ensure target account exists and is admin
+      - name: Ensure target account exists and is admin (no WMIC)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           if ($env:TARGET_USER -eq "runneradmin") {
             net user runneradmin "$env:TARGET_PASS"
-            wmic useraccount where "name='runneradmin'" set PasswordExpires=FALSE | Out-Null
+            # OPTIONAL: Avoid global policy changes; we skip password-expiry fiddling.
           } else {
             if (-not (Get-LocalUser -Name $env:TARGET_USER -ErrorAction SilentlyContinue)) {
               net user $env:TARGET_USER "$env:TARGET_PASS" /add
@@ -117,13 +120,13 @@ jobs:
               net user $env:TARGET_USER "$env:TARGET_PASS"
             }
             net localgroup Administrators $env:TARGET_USER /add
-            wmic useraccount where "name='$env:TARGET_USER'" set PasswordExpires=FALSE | Out-Null
           }
 
       - name: Enable RDP & firewall (completeness)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # RDP enabled locally; GH-hosted runners still won't accept public inbound.
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
@@ -148,28 +151,25 @@ jobs:
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f
-          sc.exe query chromoting > $null 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            net stop chromoting
-            net start chromoting
-          }
+          # Restart CRD service if present (service name 'chromoting')
+          $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
+          if ($svc) { Stop-Service chromoting -Force; Start-Service chromoting }
 
       - name: Build CRD start-host command (from full command OR from code)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "$env:CRD_START_HOST"
           $name = "$env:HOST_NAME"
           $inputText = "$env:SETUP_INPUT"
 
-          function Extract-Code([string]$s) {
-            if ($s -match 'code="?([0-9A-Za-z\/\-_]+)"?') { return $Matches[1] }
-            if ($s -match '(^|[^A-Za-z0-9\/])(?<code>4\/[0-9A-Za-z\-_]+)($|[^A-Za-z0-9\-_])') { return $Matches['code'] }
-            return $null
-          }
+          # Extract OAuth code from either full command or standalone code (4/...)
+          $code = $null
+          if ($inputText -match 'code="?([0-9A-Za-z\/\-_]+)"?') { $code = $Matches[1] }
+          elseif ($inputText -match '(4\/[0-9A-Za-z\-_]+)')     { $code = $Matches[1] }
 
-          $code = Extract-Code $inputText
-          if (-not $code) { throw "No OAuth code detected. Paste either the full command containing --code=... or the code starting with '4/'." }
+          if (-not $code) {
+            throw "No OAuth code detected. Paste either the full command containing --code=... or the code starting with '4/'."
+          }
 
           $pin = $env:PIN
           if ($pin.Length -lt 6) { throw "GCRD_PIN must be at least 6 digits." }
@@ -182,6 +182,7 @@ jobs:
             "--pin=""$pin"""
           ) -join " "
 
+          # Mask sensitive tokens
           Write-Output "::add-mask::$code"
           Write-Output "::add-mask::$pin"
 
@@ -194,7 +195,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $sec = ConvertTo-SecureString $env:TARGET_PASS -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential ("$env:COMPUTERNAME\$env:TARGET_USER", $sec)
-          Write-Host "Launching as $($env:TARGET_USER) ..."
+          Write-Host "Launching CRD as $($env:TARGET_USER) ..."
           Start-Process -FilePath "$env:CRD_START_HOST" `
                         -ArgumentList $env:CRD_ARGS `
                         -Credential $cred `
@@ -207,11 +208,14 @@ jobs:
         run: |
           Write-Host "=== Services ==="
           Get-Service TermService -ErrorAction SilentlyContinue | Format-Table -Auto
-          $svc = Get-Service chromoting -ErrorAction SilentlyContinue
+          $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
+          if (-not $svc) {
+            $svc = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
+          }
           if ($svc) { $svc | Format-Table -Auto }
-          Write-Host "`n=== Host entry (tail) ==="
+          Write-Host "`n=== Host log (tail) ==="
           $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
-          if (Test-Path $log) { Get-Content $log -Tail 80 }
+          if (Test-Path $log) { Get-Content $log -Tail 100 }
           Write-Host "`n=== Whoami / Groups ==="
           whoami /all
 
