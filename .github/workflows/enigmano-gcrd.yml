@@ -1,0 +1,127 @@
+name: "⚡ EnigMano GCRD Windows 10"
+
+on:
+  workflow_dispatch:
+    inputs:
+      INSTANCE:
+        description: "Instance number"
+        required: true
+        default: "1"
+      GCRD_CODE:
+        description: "Paste the 'Setup via SSH' OAuth code from remotedesktop.google.com"
+        required: true
+      GCRD_PIN:
+        description: "Optional numeric PIN (≥6 digits). Leave blank for no PIN."
+        required: false
+        default: ""
+      GCRD_REDIRECT_URL:
+        description: "Redirect URL"
+        required: false
+        default: "https://remotedesktop.google.com/_/oauthredirect"
+
+jobs:
+  deploy-enigmano:
+    name: "🚀 Deploy EnigMano Instance ${{ github.event.inputs.INSTANCE }}"
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: write
+
+    env:
+      # Runtime/env for your PS1
+      INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
+      WORKFLOW_FILE: "enigmano-gcrd.yml"
+      REPO: ${{ github.repository }}
+      DEPLOYMENT_ID: ${{ github.run_id }}
+      SECRET_SHAHZAIB: ${{ secrets.SECRET_SHAHZAIB }}
+
+      # Headless CRD registration inputs
+      GCRD_CODE: ${{ github.event.inputs.GCRD_CODE }}
+      GCRD_PIN: ${{ github.event.inputs.GCRD_PIN }}
+      GCRD_REDIRECT_URL: ${{ github.event.inputs.GCRD_REDIRECT_URL }}
+
+    steps:
+      - name: 📌 Parameters
+        shell: pwsh
+        run: |
+          Write-Host "==============================================="
+          Write-Host "📦 Repo               : $env:REPO"
+          Write-Host "🆔 Deployment ID      : $env:DEPLOYMENT_ID"
+          Write-Host "🖥️  Instance ID        : $env:INSTANCE_ID"
+          Write-Host "==============================================="
+
+      - name: 🔐 Validate Inputs
+        shell: pwsh
+        run: |
+          if (-not $env:GCRD_CODE) {
+            Write-Error "❌ Missing required GCRD_CODE (Setup via SSH OAuth code)."
+            exit 1
+          }
+          if ($env:GCRD_PIN -and $env:GCRD_PIN.Length -lt 6) {
+            Write-Error "❌ GCRD_PIN must be at least 6 digits when provided."
+            exit 1
+          }
+          if (-not $env:SECRET_SHAHZAIB) {
+            Write-Host "::warning title=Token not set::SECRET_SHAHZAIB is empty; workflow dispatch in the PS1 may fail."
+          }
+
+      - name: 🧩 Install Chrome Remote Desktop Host
+        shell: pwsh
+        run: |
+          $url = "https://dl.google.com/dl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $msi = Join-Path $env:TEMP "crdhost.msi"
+          Write-Host "🌐 Downloading Chrome Remote Desktop Host MSI..."
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+          Write-Host "🛠️  Installing (silent)..."
+          $args = "/i `"$msi`" /qn /norestart"
+          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Write-Error "❌ CRD Host install failed with exit code $($p.ExitCode)"
+            exit 1
+          }
+          Write-Host "✅ Chrome Remote Desktop Host installed."
+
+      - name: 🔗 Register Host via GCRD (exact SSH command)
+        shell: cmd
+        run: |
+          if NOT "%GCRD_PIN%"=="" (
+            "%PROGRAMFILES(X86)%\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" --code="%GCRD_CODE%" --redirect-url="%GCRD_REDIRECT_URL%" --name=%COMPUTERNAME% --pin=%GCRD_PIN%
+          ) ELSE (
+            "%PROGRAMFILES(X86)%\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" --code="%GCRD_CODE%" --redirect-url="%GCRD_REDIRECT_URL%" --name=%COMPUTERNAME%
+          )
+
+      - name: 📣 GCRD Status
+        shell: pwsh
+        run: |
+          $exe = Join-Path ${env:ProgramFiles(x86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (Test-Path $exe) {
+            Write-Host "::notice title=GCRD::Registered host '$env:COMPUTERNAME' via Chrome Remote Desktop."
+          } else {
+            Write-Host "::warning title=GCRD::remoting_start_host.exe not found after registration."
+          }
+
+      - name: 📥 Fetch EnigMano-Instance.ps1 (from GitLab base)
+        shell: pwsh
+        run: |
+          $url = "https://gitlab.com/Shahzaib-YT/enigmano-win10-with-sound/-/raw/main/EnigMano-Instance.ps1"
+          Write-Host "🌐 Downloading EnigMano-Instance.ps1..."
+          Invoke-WebRequest -Uri $url -OutFile "EnigMano-Instance.ps1" -UseBasicParsing
+          if (!(Test-Path "./EnigMano-Instance.ps1")) {
+            Write-Error "❌ Failed to download EnigMano-Instance.ps1"
+            exit 1
+          }
+          Write-Host "✅ EnigMano-Instance.ps1 downloaded."
+
+      - name: ⚔️ Execute EnigMano-Instance.ps1
+        shell: pwsh
+        run: |
+          Write-Host "🚦 Initiating EnigMano-Instance.ps1"
+          powershell.exe -ExecutionPolicy Bypass -File ".\EnigMano-Instance.ps1"
+
+      - name: 💠 Final Status
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "✅ EnigMano GCRD Instance $env:INSTANCE_ID completed."
+          Write-Host "🔋 Powered by: SHAHZAIB-YT"
+          Write-Host "🏁 EnigMano deployment executed with tactical precision."
