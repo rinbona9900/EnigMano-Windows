@@ -67,20 +67,21 @@ jobs:
           $ttl = [int]$ttlStr
           if ($ttl -lt 10) { $ttl = 10 }
 
-          # All users default to this password
+          # All users MUST use this default password
           $DefaultPass = "EnigMan0"
           Write-Output "::add-mask::$DefaultPass"
 
-          # Auto-PIN if blank (12 digits, deterministic)
+          # Auto PIN if blank (12 digits)
           if ([string]::IsNullOrWhiteSpace($pinInput)) {
             $seed = "EnigMano$instance"
             $sha  = [System.Security.Cryptography.SHA256]::Create()
             $buf  = [System.Text.Encoding]::UTF8.GetBytes($seed)
             $pinInput = (($sha.ComputeHash($buf) | ForEach-Object { $_ % 10 }) -join '').Substring(0,12)
           }
+          if ($pinInput -notmatch '^\d{6,}$') { throw "GCRD_PIN must be digits only and ≥ 6 characters." }
           Write-Output "::add-mask::$pinInput"
 
-          # Target user: NEW_USERNAME or runneradmin. Force password to default.
+          # Target user (NEW_USERNAME or runneradmin). Force default password.
           if ([string]::IsNullOrWhiteSpace($newUser)) {
             $TargetUser = "runneradmin"
           } else {
@@ -89,15 +90,14 @@ jobs:
 
           # Host name & TTL to env (for next step)
           "TTL_MIN=$ttl"                                              | Out-File -FilePath $env:GITHUB_ENV -Append
-          "HOST_NAME=EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"    | Out-File -FilePath $env:GITHUB_ENV -Append
+          $CRD_NAME = "EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"
+          "CRD_NAME=$CRD_NAME"                                        | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # ---------- Ensure Target Account (sole active admin intent) ----------
+          # ---------- Ensure Target Account (single enabled admin) ----------
           if ($TargetUser -eq "runneradmin") {
-            # Update runneradmin password and ensure admin
             net user runneradmin "$DefaultPass"
             try { net localgroup Administrators runneradmin /add | Out-Null } catch {}
           } else {
-            # Create or update requested admin
             if (-not (Get-LocalUser -Name $TargetUser -ErrorAction SilentlyContinue)) {
               net user $TargetUser "$DefaultPass" /add
             } else {
@@ -105,47 +105,36 @@ jobs:
             }
             net localgroup Administrators $TargetUser /add
           }
-
-          # Try to set PasswordNeverExpires when available
           if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
             try { Set-LocalUser -Name $TargetUser -PasswordNeverExpires $true } catch {}
           }
 
-          # ---------- Enforce "only one user" (best-effort within hosted runner constraints) ----------
-          # We keep TargetUser; attempt to delete/disable others (system/built-ins are skipped).
-          $protected = @('Administrator','DefaultAccount','WDAGUtilityAccount','Guest')
-          $currentUser = ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1])
+          # ---------- AutoAdminLogon to the TargetUser ----------
+          $wl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+          New-Item -Path $wl -Force | Out-Null
+          Set-ItemProperty -Path $wl -Name "AutoAdminLogon"    -Value "1"
+          Set-ItemProperty -Path $wl -Name "ForceAutoLogon"    -Type DWord -Value 1
+          Set-ItemProperty -Path $wl -Name "DefaultUserName"   -Value $TargetUser
+          Set-ItemProperty -Path $wl -Name "DefaultPassword"   -Value $DefaultPass
+          Set-ItemProperty -Path $wl -Name "DefaultDomainName" -Value $env:COMPUTERNAME
 
+          # ---------- Enforce ONLY one accessible account ----------
+          # Disable every local user EXCEPT the TargetUser (built-ins included if possible).
+          $currentUser = ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1])
           Get-LocalUser | ForEach-Object {
             $name = $_.Name
-            if ($name -eq $TargetUser) {
-              # ensure default password on target
+            if ($name -ne $TargetUser) {
               try { net user $name "$DefaultPass" | Out-Null } catch {}
-              return
-            }
-            if ($protected -contains $name) {
-              # Set default password where possible and disable non-essential built-ins
-              try { net user $name "$DefaultPass" | Out-Null } catch {}
-              try { if ($name -ne 'Administrator') { Disable-LocalUser -Name $name -ErrorAction SilentlyContinue } } catch {}
-              return
-            }
-            if ($name -eq $currentUser) {
-              # Cannot remove the account running this job; align password and carry on
-              try { net user $name "$DefaultPass" | Out-Null } catch {}
-              return
-            }
-            # Try delete; if fails, disable
-            try {
-              net user $name /delete | Out-Null
-            } catch {
               try { Disable-LocalUser -Name $name -ErrorAction SilentlyContinue } catch {}
+            } else {
+              try { net user $name "$DefaultPass" | Out-Null } catch {}
+              if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+                try { Set-LocalUser -Name $name -PasswordNeverExpires $true } catch {}
+              }
             }
           }
 
-          # If target is not runneradmin and runneradmin exists but is the current account,
-          # align password and keep; CRD registration will still run as TargetUser via scheduled task.
-
-          # ---------- Enable RDP locally (note: inbound to GH runner is not possible) ----------
+          # ---------- Enable RDP locally (note: GH runners are not reachable via RDP) ----------
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
@@ -153,14 +142,14 @@ jobs:
 
           # ---------- Install Chrome Remote Desktop Host ----------
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
-          Invoke-WebRequest -Uri "${{ env.MSI_URL }}" -OutFile $msi
+          Invoke-WebRequest -Uri "$env:MSI_URL" -OutFile $msi
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $msi, "/qn", "/norestart") -Wait
 
           $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
           $CRD_EXE = Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe'
           if (-not (Test-Path $CRD_EXE)) { throw "remoting_start_host.exe not found at: $CRD_EXE" }
 
-          # ---------- Apply CRD stability policies (no early restart) ----------
+          # ---------- Apply CRD stability policies ----------
           reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f | Out-Null
@@ -176,7 +165,6 @@ jobs:
           Write-Output "::add-mask::$code"
 
           # ---------- Build CRD args ----------
-          $CRD_NAME = "EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"
           $args = @(
             "--code=""$code"""
             "--redirect-url=""$redirectUrl"""
@@ -184,22 +172,77 @@ jobs:
             "--pin=""$pinInput"""
           ) -join " "
 
-          # Export for next step
-          "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          # ---------- Register CRD as TargetUser via Scheduled Task (reliable elevated run) ----------
+          # ---------- Register CRD as TargetUser via Scheduled Task ----------
           $task = "CRD-Register-$CRD_NAME"
           $cmd  = Join-Path $env:TEMP "crd_register.cmd"
           "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
-
-          # Ensure TargetUser has the default password (again)
-          try { net user $TargetUser "$DefaultPass" | Out-Null } catch {}
 
           schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st 00:00 /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
           schtasks /run /tn "$task" | Out-Null
           Start-Sleep -Seconds 10
 
-          # ---------- Start CRD service with retries (post-registration) ----------
+          # ---------- Force creation of TargetUser profile (if not yet present) ----------
+          $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
+          $profilePath = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $sid }).LocalPath
+          if (-not $profilePath) {
+            # Run a trivial command as the user to trigger profile creation
+            $task2 = "CRD-ProfileWarmup-$CRD_NAME"
+            $cmd2  = Join-Path $env:TEMP "warmup.cmd"
+            "@echo off`r`nwhoami > %TEMP%\whoami.txt`r`nexit /b 0" | Out-File -FilePath $cmd2 -Encoding ASCII -Force
+            schtasks /create /tn "$task2" /tr "$cmd2" /sc ONCE /st 00:00 /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
+            schtasks /run /tn "$task2" | Out-Null
+            Start-Sleep -Seconds 5
+            $profilePath = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $sid }).LocalPath
+          }
+
+          # ---------- TargetUser DPI scaling to 100% (host-controlled) ----------
+          if ($profilePath -and (Test-Path $profilePath)) {
+            $ntuser = Join-Path $profilePath "NTUSER.DAT"
+            if (Test-Path $ntuser) {
+              reg load "HKU\TempHive" "$ntuser" | Out-Null
+              try {
+                reg add "HKU\TempHive\Control Panel\Desktop" /v LogPixels /t REG_DWORD /d 96 /f | Out-Null
+                reg add "HKU\TempHive\Control Panel\Desktop" /v Win8DpiScaling /t REG_DWORD /d 0 /f | Out-Null
+              } finally {
+                reg unload "HKU\TempHive" | Out-Null
+              }
+            }
+          }
+
+          # ---------- System headless resolution: force 1920x1080 (best-effort) ----------
+          function Set-HeadlessRes {
+            param([int]$W = 1920, [int]$H = 1080)
+            $gfxRoot = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
+            if (Test-Path $gfxRoot) {
+              Get-ChildItem $gfxRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $k1 = Join-Path $_.PSPath "00"
+                $k2 = Join-Path $k1 "00"
+                try {
+                  New-Item -Path $k1 -Force | Out-Null
+                  New-Item -Path $k2 -Force | Out-Null
+                  New-ItemProperty -Path $k1 -Name "PrimSurfSize.cx" -Value $W -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k1 -Name "PrimSurfSize.cy" -Value $H -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k1 -Name "Stride"         -Value (($W * 32 + 7) / 8) -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k2 -Name "ActiveSize.cx"  -Value $W -PropertyType DWord -Force | Out-Null
+                  New-ItemProperty -Path $k2 -Name "ActiveSize.cy"  -Value $H -PropertyType DWord -Force | Out-Null
+                } catch {}
+              }
+            }
+          }
+          Set-HeadlessRes 1920 1080
+
+          # Try to apply without reboot by toggling display adapter
+          try {
+            Import-Module PnpDevice -ErrorAction SilentlyContinue
+            $disp = Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($disp) {
+              Disable-PnpDevice -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+              Start-Sleep -Seconds 2
+              Enable-PnpDevice  -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+            }
+          } catch {}
+
+          # ---------- Start CRD service with retries ----------
           function TryStart([string]$name) {
             $ErrorActionPreference = "Continue"
             $s = Get-Service -Name $name -ErrorAction SilentlyContinue
@@ -214,7 +257,6 @@ jobs:
             }
             return $false
           }
-
           $started = TryStart "chromoting"
           if (-not $started) {
             $svc2 = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
@@ -233,8 +275,11 @@ jobs:
           Write-Host "`n=== Accounts (post-enforcement) ==="
           Get-LocalUser | Select-Object Name,Enabled | Format-Table -Auto
 
-          Write-Host "`n=== Whoami / Groups ==="
-          whoami /all
+          Write-Host "`n=== AutoAdminLogon Target ==="
+          Write-Host "Will auto-logon as: $TargetUser"
+
+          Write-Host "`n=== Display Devices ==="
+          try { Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Format-Table -Auto } catch {}
 
       - name: "Connect instructions + keep alive"
         shell: pwsh
@@ -246,6 +291,8 @@ jobs:
           Write-Host "    then open: https://remotedesktop.google.com/access"
           Write-Host "    Your host should appear as: $env:CRD_NAME"
           Write-Host "-----------------------------------------------------"
+          Write-Host "AutoAdminLogon is set. Other local users are disabled to prevent logon."
+          Write-Host "Headless display forced to 1920x1080; DPI scaling set to 100%."
           Write-Host "Note: RDP is enabled locally for completeness, but GitHub-hosted"
           Write-Host "runners do not accept inbound connections from the internet."
           Write-Host "Use Chrome Remote Desktop for access."
