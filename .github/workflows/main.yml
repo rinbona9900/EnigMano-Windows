@@ -1,4 +1,4 @@
-name: "EnigMano GCRD Windows — Phoenix Clean"
+name: "⚡ EnigMano GCRD Windows — Magical Ultra"
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
         required: false
         default: "https://remotedesktop.google.com/_/oauthredirect"
       TTL_MINUTES:
-        description: "Keep-alive duration for this session (minutes)"
+        description: "Keep-alive duration for this session"
         required: false
         default: "120"
 
@@ -42,27 +42,27 @@ jobs:
       RAW_REDIRECT_URL:   ${{ inputs.GCRD_REDIRECT_URL }}
       RAW_TTL:            ${{ inputs.TTL_MINUTES }}
 
-      DEFAULT_PASS:   "EnigMan0"    # fixed local user password
-      FIXED_GCRD_PIN: "36446266"    # fixed CRD PIN (numeric)
+      # Single source of truth (requested)
+      DEFAULT_PASS:   "EnigMan0"   # local user password
+      FIXED_GCRD_PIN: "36446266"   # CRD PIN (numeric)
 
+      # Installer
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
 
     steps:
-      - name: Prep variables + ensure admin user + AutoAdminLogon
+      - name: "Setup host + CRD + AutoLogon + Selected 1080p"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $instance    = ($env:INSTANCE         | % { $_.Trim() })
-          $setupInput  = ($env:RAW_SETUP        | % { $_.Trim() })
-          $redirectUrl = ($env:RAW_REDIRECT_URL | % { $_.Trim() })
-          $newUser     = ($env:RAW_NEW_USERNAME | % { $_.Trim() })
-          $ttlStr      = ($env:RAW_TTL          | % { $_.Trim() })
-
+          # ---------- Inputs & masks ----------
+          $instance    = ($env:INSTANCE         | ForEach-Object { $_.Trim() })
+          $setupInput  = ($env:RAW_SETUP        | ForEach-Object { $_.Trim() })
+          $redirectUrl = ($env:RAW_REDIRECT_URL | ForEach-Object { $_.Trim() })
+          $newUser     = ($env:RAW_NEW_USERNAME | ForEach-Object { $_.Trim() })
+          $ttlStr      = ($env:RAW_TTL          | ForEach-Object { $_.Trim() })
           if (-not [int]::TryParse($ttlStr, [ref]0)) { $ttlStr = "120" }
-          $ttl = [int]$ttlStr
-          if ($ttl -lt 10) { $ttl = 10 }
-          $ttl = [Math]::Min($ttl, 335)  # under job timeout
+          $ttl = [int]$ttlStr; if ($ttl -lt 10) { $ttl = 10 }
 
           $DefaultPass = $env:DEFAULT_PASS
           $Pin         = $env:FIXED_GCRD_PIN
@@ -70,12 +70,13 @@ jobs:
           Write-Output "::add-mask::$Pin"
 
           $TargetUser = if ([string]::IsNullOrWhiteSpace($newUser)) { "runneradmin" } else { $newUser }
-
+          $CRD_NAME   = "EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"
           "TTL_MIN=$ttl" | Out-File -FilePath $env:GITHUB_ENV -Append
-          $CRD_NAME = "EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"
           "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # Ensure target admin exists and is admin
+          Start-Sleep -Seconds 2
+
+          # ---------- Ensure Target Admin ----------
           if ($TargetUser -eq "runneradmin") {
             net user runneradmin "$DefaultPass"
             try { net localgroup Administrators runneradmin /add | Out-Null } catch {}
@@ -90,42 +91,38 @@ jobs:
           try { Set-LocalUser -Name $TargetUser -PasswordNeverExpires $true } catch {}
           Start-Sleep -Seconds 2
 
-          # AutoAdminLogon (for future boots)
+          # ---------- AutoAdminLogon (future boots) ----------
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
           reg add "$wl" /v DefaultUserName   /t REG_SZ    /d "$TargetUser"  /f | Out-Null
           reg add "$wl" /v DefaultDomainName /t REG_SZ    /d "$env:COMPUTERNAME" /f | Out-Null
           reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
+          Start-Sleep -Seconds 1
 
-          # Keep awake
+          # ---------- Keep awake ----------
           powercfg -x -monitor-timeout-ac 0
           powercfg -x -standby-timeout-ac 0
           powercfg -x -hibernate-timeout-ac 0
 
-      - name: Install Chrome Remote Desktop host
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          # ---------- RDP (informational) ----------
+          try {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+            Set-Service -Name TermService -StartupType Automatic
+            Start-Service TermService
+          } catch {}
+          Start-Sleep -Seconds 1
+
+          # ---------- Install CRD ----------
           $msi = Join-Path $env:TEMP "chromeremotedesktophost.msi"
-          Invoke-WebRequest -Uri "${{ env.MSI_URL }}" -OutFile $msi
+          Invoke-WebRequest -Uri $env:MSI_URL -OutFile $msi
           Start-Process msiexec.exe -ArgumentList @("/i",$msi,"/qn","/norestart") -Wait
           Start-Sleep -Seconds 4
 
-      - name: Register CRD via elevated scheduled task (reliable)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $DefaultPass = $env:DEFAULT_PASS
-          $Pin         = $env:FIXED_GCRD_PIN
-          $TargetUser  = if ([string]::IsNullOrWhiteSpace($env:RAW_NEW_USERNAME)) { "runneradmin" } else { $env:RAW_NEW_USERNAME }
-          $CRD_NAME    = $env:CRD_NAME
-          $redirectUrl = $env:RAW_REDIRECT_URL
-          $setupInput  = $env:RAW_SETUP
-
-          # Find CRD host binary (path-drift safe)
-          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86'); $pf64 = $env:ProgramFiles
+          # Discover CRD host binary (path-drift safe)
+          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $pf64 = $env:ProgramFiles
           $cands = @(
             (Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe'),
             (Join-Path $pf64 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe')
@@ -135,61 +132,45 @@ jobs:
           $CRD_EXE = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $CRD_EXE) { throw "remoting_start_host.exe not found." }
 
-          # CRD policies
+          # Stable CRD policies
           reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f | Out-Null
+          Start-Sleep -Seconds 1
 
-          # Parse OAuth code
+          # ---------- Parse OAuth code ----------
           $code = $null
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-\._~]+)"?') { $code = $Matches[1] }
           elseif ($setupInput -match '(4\/[0-9A-Za-z\-\._~]+)')     { $code = $Matches[1] }
           if (-not $code) { throw "No OAuth code detected. Paste full command with --code=... or the code starting with '4/'." }
           Write-Output "::add-mask::$code"
 
+          # ---------- Register CRD under TARGET USER ----------
           $args = @("--code=""$code""","--redirect-url=""$redirectUrl""","--name=""$CRD_NAME""","--pin=""$Pin""") -join " "
-
-          # Use scheduled task (elevation-safe)
-          $task = "CRD-Register-$CRD_NAME"
-          $cmd  = Join-Path $env:TEMP "crd_register.cmd"
-          "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
-          $st = (Get-Date).AddMinutes(2).ToString('HH:mm')
-          schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st $st /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
-          Start-Sleep -Seconds 2
-          schtasks /run /tn "$task" | Out-Null
-          Start-Sleep -Seconds 10
-
-          # Ensure CRD service running
-          function TryStart([string]$n){
-            $s = Get-Service -Name $n -EA SilentlyContinue
-            if ($s) {
-              sc.exe config $n start= auto | Out-Null
-              for ($i=0;$i -lt 8;$i++){
-                try { Start-Service $n -EA Stop } catch { Start-Sleep -Seconds 3; continue }
-                $s = Get-Service -Name $n -EA SilentlyContinue
-                if ($s.Status -eq 'Running'){ return $true }
-                Start-Sleep -Seconds 2
-              }
-            }
-            return $false
-          }
-          if (-not (TryStart "chromoting")) {
-            $svc2 = Get-Service -DisplayName "Chrome Remote Desktop Service" -EA SilentlyContinue
-            if ($svc2) { [void](TryStart $svc2.Name) }
-          }
-          Start-Sleep -Seconds 2
-
-      - name: Force logged-on desktop (now)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $TargetUser  = if ([string]::IsNullOrWhiteSpace($env:RAW_NEW_USERNAME)) { "runneradmin" } else { $env:RAW_NEW_USERNAME }
-          $DefaultPass = $env:DEFAULT_PASS
-
           $sec  = ConvertTo-SecureString $DefaultPass -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$TargetUser",$sec)
 
+          $crdOk = $false
+          try {
+            Start-Process -FilePath $CRD_EXE -ArgumentList $args -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait
+            $crdOk = $true
+          } catch {
+            Write-Host "Direct CRD register failed ($($_.Exception.Message)). Using scheduled task fallback."
+          }
+
+          if (-not $crdOk) {
+            $task = "CRD-Register-$CRD_NAME"
+            $cmd  = Join-Path $env:TEMP "crd_register.cmd"
+            "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
+            $st = (Get-Date).AddMinutes(2).ToString('HH:mm')
+            schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st $st /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
+            Start-Sleep -Seconds 2
+            schtasks /run /tn "$task" | Out-Null
+            Start-Sleep -Seconds 8
+          }
+
+          # ---------- Force a real logged-on desktop NOW ----------
           try {
             Start-Process -FilePath "$env:WINDIR\System32\userinit.exe" -ArgumentList "$env:WINDIR\explorer.exe" -Credential $cred -LoadUserProfile -WindowStyle Hidden
             Start-Sleep -Seconds 3
@@ -197,27 +178,11 @@ jobs:
             Write-Host "Userinit launch warning: $($_.Exception.Message)"
           }
 
-          try {
-            $procs = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'"
-            foreach ($p in $procs){ $null=$p.GetOwner([ref]$u,[ref]$d); if ($u) { Write-Host "Explorer owned by: $d\$u" } }
-          } catch {}
-
-      - name: Apply 1920x1080 in user session (Win32 API) with fallback
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $TargetUser  = if ([string]::IsNullOrWhiteSpace($env:RAW_NEW_USERNAME)) { "runneradmin" } else { $env:RAW_NEW_USERNAME }
-          $DefaultPass = $env:DEFAULT_PASS
-
-          $sec  = ConvertTo-SecureString $DefaultPass -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$TargetUser",$sec)
-
-          # Write C# helper to disk (no escaping issues)
-          $csPath = Join-Path $env:TEMP "SetRes.cs"
-          $cs = @'
+          # ---------- Selected 1920x1080 via Win32 API (user session) ----------
+          $csharp = @'
 using System;
 using System.Runtime.InteropServices;
-public class SetRes {
+public class Res {
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
   public struct DEVMODE {
     private const int CCHDEVICENAME = 32, CCHFORMNAME = 32;
@@ -229,47 +194,39 @@ public class SetRes {
     public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
     public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
   }
-  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettings(ref DEVMODE devMode, int flags);
-  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern bool EnumDisplaySettings(string d, int m, ref DEVMODE dm);
+  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettingsEx(string d, ref DEVMODE dm, IntPtr h, int f, IntPtr p);
   public static int Apply(int w, int h, int bpp, int hz){
-    const int ENUM_CURRENT_SETTINGS = -1, CDS_UPDATEREGISTRY = 0x01, DM_PELSWIDTH=0x80000, DM_PELSHEIGHT=0x100000, DM_BITSPERPEL=0x40000;
-    DEVMODE dm = new DEVMODE(); dm.dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf(typeof(DEVMODE));
-    if (!EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm)) return -999;
-    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
-    dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmBitsPerPel = bpp; dm.dmDisplayFrequency = hz;
-    return ChangeDisplaySettings(ref dm, CDS_UPDATEREGISTRY);
+    const int ENUM_CURRENT_SETTINGS = -1, CDS_UPDATEREGISTRY = 0x01;
+    const int DM_PELSWIDTH=0x80000, DM_PELSHEIGHT=0x100000, DM_BITSPERPEL=0x40000, DM_DISPLAYFREQUENCY=0x400000;
+    DEVMODE dm = new DEVMODE(); dm.dmSize=(short)Marshal.SizeOf(typeof(DEVMODE));
+    if(!EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm)) return -999;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    dm.dmPelsWidth=w; dm.dmPelsHeight=h; dm.dmBitsPerPel=bpp; dm.dmDisplayFrequency=hz;
+    return ChangeDisplaySettingsEx(null, ref dm, IntPtr.Zero, CDS_UPDATEREGISTRY, IntPtr.Zero);
   }
 }
 '@
-          Set-Content -Path $csPath -Value $cs -Encoding ASCII
-
-          # Build a small PS1 wrapper to compile and apply (run in user context)
-          $applyPath = Join-Path $env:TEMP "apply_res.ps1"
-          $apply = @'
-Add-Type -Path "$env:TEMP\SetRes.cs"
-$rc = [SetRes]::Apply(1920,1080,32,60)
-Write-Host "ChangeDisplaySettings returned: $rc"
-if ($rc -ne 0) { exit 1 }
-'@
-          Set-Content -Path $applyPath -Value $apply -Encoding ASCII
-
-          $ok = $true
-          try {
-            Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$applyPath`"" -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait
-          } catch {
-            $ok = $false
-            Write-Host "Win32 resolution apply failed: $($_.Exception.Message)"
+          $apply = {
+            Add-Type -TypeDefinition $using:csharp | Out-Null
+            $rc = [Res]::Apply(1920,1080,32,60)
+            Write-Host "ChangeDisplaySettingsEx returned: $rc"
+            if ($rc -ne 0) { exit 1 }
           }
-
-          if (-not $ok) {
-            Write-Host "Applying registry fallback for headless 1920x1080..."
+          $tmp = Join-Path $env:TEMP "apply_res.ps1"
+          $apply.ToString() | Out-File -FilePath $tmp -Encoding ASCII -Force
+          try {
+            Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait
+          } catch {
+            Write-Host "Win32 resolution setter failed; applying registry fallback."
             function Set-HeadlessRes([int]$W=1920,[int]$H=1080){
               $gfx = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
               if (Test-Path $gfx) {
-                Get-ChildItem $gfx -EA SilentlyContinue | % {
+                Get-ChildItem $gfx -ErrorAction SilentlyContinue | ForEach-Object {
                   $k1 = Join-Path $_.PSPath "00"; $k2 = Join-Path $k1 "00"
                   try {
-                    New-Item -Path $k1 -Force | Out-Null; New-Item -Path $k2 -Force | Out-Null
+                    New-Item -Path $k1 -Force | Out-Null
+                    New-Item -Path $k2 -Force | Out-Null
                     New-ItemProperty -Path $k1 -Name "PrimSurfSize.cx" -Value $W -PropertyType DWord -Force | Out-Null
                     New-ItemProperty -Path $k1 -Name "PrimSurfSize.cy" -Value $H -PropertyType DWord -Force | Out-Null
                     New-ItemProperty -Path $k1 -Name "Stride"         -Value ($W*4) -PropertyType DWord -Force | Out-Null
@@ -281,11 +238,12 @@ if ($rc -ne 0) { exit 1 }
             }
             Set-HeadlessRes 1920 1080
           }
+          Start-Sleep -Seconds 2
 
-          # 100% DPI for target user
+          # ---------- 100% DPI for TargetUser ----------
           try {
             $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
-            $profilePath = (Get-CimInstance Win32_UserProfile -EA SilentlyContinue | ? { $_.SID -eq $sid }).LocalPath
+            $profilePath = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $sid }).LocalPath
             if ($profilePath) {
               $ntuser = Join-Path $profilePath "NTUSER.DAT"
               if (Test-Path $ntuser) {
@@ -297,31 +255,50 @@ if ($rc -ne 0) { exit 1 }
               }
             }
           } catch {}
+          Start-Sleep -Seconds 1
 
-      - name: Verify + keep alive
-        if: ${{ always() }}
-        shell: pwsh
-        run: |
-          Write-Host "====================================================="
-          Write-Host " Chrome Remote Desktop registered as: $env:CRD_NAME"
-          Write-Host " Target user launched (userinit + explorer) for a live desktop."
-          Write-Host " Resolution applied: 1920x1080 (Win32 API; registry fallback otherwise)."
-          Write-Host " DPI: 100%. TTL: $env:TTL_MIN minutes."
-          Write-Host "====================================================="
-
-          Write-Host "`n=== CRD Service Status ==="
-          Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
-
-          $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
-          if (Test-Path $log) {
-            Write-Host "`n=== Host log (tail) ==="
-            Get-Content $log -Tail 120
+          # ---------- Ensure CRD service running ----------
+          function TryStart([string]$n){
+            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+            if ($s) {
+              sc.exe config $n start= auto | Out-Null
+              for ($i=0;$i -lt 8;$i++){
+                try { Start-Service $n -ErrorAction Stop } catch { Start-Sleep -Seconds 3; continue }
+                $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+                if ($s.Status -eq 'Running'){ return $true }
+                Start-Sleep -Seconds 2
+              }
+            }
+            return $false
+          }
+          if (-not (TryStart "chromoting")) {
+            $svc2 = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
+            if ($svc2) { [void](TryStart $svc2.Name) }
           }
 
-          Write-Host "`n=== Explorer owners (expect target user) ==="
+          # ---------- Logs & verification ----------
+          Write-Host "=== CRD Service Status ==="; Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
+          $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
+          Write-Host "`n=== Host log (tail) ==="; if (Test-Path $log) { Get-Content $log -Tail 120 }
+          Write-Host "`n=== Explorer owners ==="
           try {
             $procs = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'"
             foreach ($p in $procs){ $null=$p.GetOwner([ref]$u,[ref]$d); if ($u) { Write-Host "Explorer owned by: $d\$u" } }
           } catch {}
 
+      - name: "Connect instructions + keep alive"
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Write-Host "====================================================="
+          Write-Host " ✅ Chrome Remote Desktop registration attempted."
+          Write-Host "    Name: $env:CRD_NAME"
+          Write-Host "    Sign into the SAME Google account used to create the code,"
+          Write-Host "    then open: https://remotedesktop.google.com/access"
+          Write-Host "    Your host should appear as: $env:CRD_NAME"
+          Write-Host "-----------------------------------------------------"
+          Write-Host "Target user desktop is launched (userinit + explorer)."
+          Write-Host "Resolution set to 1920x1080 via Win32 API (registry fallback if needed)."
+          Write-Host "DPI scaling set to 100%. Sleep disabled."
+          Write-Host "====================================================="
           Start-Sleep -Seconds (60 * [int]$env:TTL_MIN)
