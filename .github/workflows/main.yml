@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows — Ultra"
+name: "⚡ EnigMano GCRD Windows — Ultra+ (Interactive Autologon & 1080p)"
 
 on:
   workflow_dispatch:
@@ -42,11 +42,14 @@ jobs:
       RAW_REDIRECT_URL:   ${{ inputs.GCRD_REDIRECT_URL }}
       RAW_TTL:            ${{ inputs.TTL_MINUTES }}
 
-      # === Single source of truth for auth material ===
-      DEFAULT_PASS:   "EnigMan0"   # Local account password (fixed as requested)
-      FIXED_GCRD_PIN: "36446266"   # CRD PIN (fixed as requested; numeric as required by CRD)
+      # === Single source of truth (fixed as requested) ===
+      DEFAULT_PASS:   "EnigMan0"   # Local account password (fixed)
+      FIXED_GCRD_PIN: "36446266"   # CRD PIN (fixed numeric as required)
 
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
+      # Sysinternals + NirCmd (official links)
+      SYSINT_URL: https://download.sysinternals.com/files/SysinternalsSuite.zip
+      NIRCMD_URL: https://www.nirsoft.net/utils/nircmd-x64.zip
 
     steps:
       - name: "Setup Environment"
@@ -66,14 +69,13 @@ jobs:
           $ttl = [int]$ttlStr
           if ($ttl -lt 10) { $ttl = 10 }
 
-          # ---------- Fixed secrets (mask) ----------
           $DefaultPass = $env:DEFAULT_PASS
           $Pin         = $env:FIXED_GCRD_PIN
-          Write-Output "::add-mask::$DefaultPass"
-          Write-Output "::add-mask::$Pin"
+          "::add-mask::$DefaultPass" | Out-Host
+          "::add-mask::$Pin" | Out-Host
 
-          # ---------- Target user (NEW_USERNAME or runneradmin) ----------
-          if ([string]::IsNullOrWhiteSpace($newUser)) { $TargetUser = "runneradmin" } else { $TargetUser = $newUser }
+          # ---------- Target user ----------
+          $TargetUser = if ([string]::IsNullOrWhiteSpace($newUser)) { "runneradmin" } else { $newUser }
 
           # ---------- Export shared env ----------
           "TTL_MIN=$ttl" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -99,7 +101,7 @@ jobs:
           }
           Start-Sleep -Seconds 2
 
-          # ---------- AutoAdminLogon to TargetUser (so session exists) ----------
+          # ---------- Persist AutoAdminLogon (for future boots), but we'll also create a session NOW ----------
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           & reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           & reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
@@ -150,7 +152,7 @@ jobs:
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-\._~]+)"?') { $code = $Matches[1] }
           elseif ($setupInput -match '(4\/[0-9A-Za-z\-\._~]+)')     { $code = $Matches[1] }
           if (-not $code) { throw "No OAuth code detected. Paste full command w/ --code=... or the code starting with '4/'." }
-          Write-Output "::add-mask::$code"
+          "::add-mask::$code" | Out-Host
 
           # ---------- Build CRD args ----------
           $args = @(
@@ -165,48 +167,43 @@ jobs:
           $cmd  = Join-Path $env:TEMP "crd_register.cmd"
           "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
 
-          $start = (Get-Date).AddMinutes(1).ToString('HH:mm')
+          $start = (Get-Date).AddMinutes(2).ToString('HH:mm')
           schtasks /create /tn "$task" /tr "$cmd" /sc ONCE /st $start /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /F | Out-Null
           Start-Sleep -Seconds 2
           schtasks /run /tn "$task" | Out-Null
           Start-Sleep -Seconds 10
 
-          # ---------- Warm up TargetUser profile ----------
-          try {
-            $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
-            $profilePath = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $sid }).LocalPath
-            if (-not $profilePath) {
-              $task2 = "CRD-ProfileWarmup-$CRD_NAME"
-              $cmd2  = Join-Path $env:TEMP "warmup.cmd"
-              "@echo off`r`nwhoami > %TEMP%\whoami.txt`r`nstart explorer.exe`r`nexit /b 0" | Out-File -FilePath $cmd2 -Encoding ASCII -Force
-              $start2 = (Get-Date).AddMinutes(1).ToString('HH:mm')
-              schtasks /create /tn "$task2" /tr "$cmd2" /sc ONCE /st $start2 /RL HIGHEST /RU "$env:COMPUTERNAME\$TargetUser" /RP "$DefaultPass" /IT /F | Out-Null
-              Start-Sleep -Seconds 2
-              schtasks /run /tn "$task2" | Out-Null
-              Start-Sleep -Seconds 5
-              $profilePath = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $sid }).LocalPath
-            }
-          } catch {}
+          # ---------- DOWNLOAD PsExec + NirCmd (to create live interactive session and set 1080p) ----------
+          $ToolsDir = Join-Path $env:TEMP "em-tools"
+          New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+
+          $sysZip = Join-Path $ToolsDir "sysinternals.zip"
+          Invoke-WebRequest -Uri "${{ env.SYSINT_URL }}" -OutFile $sysZip
+          Expand-Archive -Path $sysZip -DestinationPath $ToolsDir -Force
+          $PsExec = Get-ChildItem -Path $ToolsDir -Recurse -Filter "PsExec.exe" | Select-Object -First 1
+          if (-not $PsExec) { throw "PsExec.exe not found after download." }
+
+          $nirZip = Join-Path $ToolsDir "nircmd.zip"
+          Invoke-WebRequest -Uri "${{ env.NIRCMD_URL }}" -OutFile $nirZip
+          Expand-Archive -Path $nirZip -DestinationPath $ToolsDir -Force
+          $NirCmd = Get-ChildItem -Path $ToolsDir -Recurse -Filter "nircmdc.exe" | Select-Object -First 1
+          if (-not $NirCmd) { throw "nircmdc.exe not found after download." }
+
           Start-Sleep -Seconds 2
 
-          # ---------- DPI scaling to 100% for TargetUser ----------
-          try {
-            if ($profilePath -and (Test-Path $profilePath)) {
-              $ntuser = Join-Path $profilePath "NTUSER.DAT"
-              if (Test-Path $ntuser) {
-                reg load "HKU\TempHive" "$ntuser" | Out-Null
-                try {
-                  reg add "HKU\TempHive\Control Panel\Desktop" /v LogPixels /t REG_DWORD /d 96 /f | Out-Null
-                  reg add "HKU\TempHive\Control Panel\Desktop" /v Win8DpiScaling /t REG_DWORD /d 0 /f | Out-Null
-                } finally {
-                  reg unload "HKU\TempHive" | Out-Null
-                }
-              }
-            }
-          } catch {}
-          Start-Sleep -Seconds 2
+          # ---------- CREATE INTERACTIVE DESKTOP SESSION for TargetUser NOW (no reboot) ----------
+          # Console session is typically 1 on GH runners; use -i 1 to attach and start explorer.exe
+          & "$($PsExec.FullName)" -accepteula -i 1 -u "$env:COMPUTERNAME\$TargetUser" -p "$DefaultPass" cmd /c "whoami > %TEMP%\whoami.txt & start explorer.exe"
+          Start-Sleep -Seconds 6
 
-          # ---------- System headless resolution: force 1920x1080 ----------
+          # ---------- FORCE 1920x1080 @ 32bpp + 100% DPI inside that user session ----------
+          & "$($PsExec.FullName)" -accepteula -i 1 -u "$env:COMPUTERNAME\$TargetUser" -p "$DefaultPass" `"$($NirCmd.FullName)`" setdisplay 1920 1080 32
+          Start-Sleep -Seconds 3
+          # Also ensure 100% DPI (96 DPI)
+          & "$($PsExec.FullName)" -accepteula -i 1 -u "$env:COMPUTERNAME\$TargetUser" -p "$DefaultPass" `"$($NirCmd.FullName)`" setdpiscale 100
+          Start-Sleep -Seconds 3
+
+          # ---------- Extra: ensure registry headless values (best-effort, harmless if already set) ----------
           function Set-HeadlessRes {
             param([int]$W = 1920, [int]$H = 1080)
             $gfxRoot = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
@@ -219,7 +216,6 @@ jobs:
                   New-Item -Path $k2 -Force | Out-Null
                   New-ItemProperty -Path $k1 -Name "PrimSurfSize.cx" -Value $W -PropertyType DWord -Force | Out-Null
                   New-ItemProperty -Path $k1 -Name "PrimSurfSize.cy" -Value $H -PropertyType DWord -Force | Out-Null
-                  # Stride must be integer (bytes per line): 32bpp => W*4
                   New-ItemProperty -Path $k1 -Name "Stride"         -Value ($W * 4) -PropertyType DWord -Force | Out-Null
                   New-ItemProperty -Path $k2 -Name "ActiveSize.cx"  -Value $W -PropertyType DWord -Force | Out-Null
                   New-ItemProperty -Path $k2 -Name "ActiveSize.cy"  -Value $H -PropertyType DWord -Force | Out-Null
@@ -228,18 +224,6 @@ jobs:
             }
           }
           Set-HeadlessRes 1920 1080
-          Start-Sleep -Seconds 3
-
-          # Attempt to reinitialize display adapter (best-effort)
-          try {
-            Import-Module PnpDevice -ErrorAction SilentlyContinue
-            $disp = Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($disp) {
-              Disable-PnpDevice -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-              Start-Sleep -Seconds 3
-              Enable-PnpDevice  -InstanceId $disp.InstanceId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-            }
-          } catch {}
           Start-Sleep -Seconds 2
 
           # ---------- Start CRD service with retries ----------
@@ -257,14 +241,10 @@ jobs:
             }
             return $false
           }
-          $started = TryStart "chromoting"
-          if (-not $started) {
-            $svc2 = Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
-            if ($svc2) { [void](TryStart $svc2.Name) }
-          }
+          $null = TryStart "chromoting"
           Start-Sleep -Seconds 2
 
-          # ---------- (Optional) Enforce only TargetUser enabled after CRD registration ----------
+          # ---------- (Optional) Enforce only TargetUser enabled after registration ----------
           try {
             Get-LocalUser | ForEach-Object {
               $name = $_.Name
@@ -279,14 +259,12 @@ jobs:
           } catch {}
           Start-Sleep -Seconds 2
 
-          # ---------- Verify & tail logs ----------
-          Write-Host "=== CRD Service Status ==="
-          Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
-          Get-Service -DisplayName "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue | Format-Table -Auto
+          # ---------- Diagnostics ----------
+          Write-Host "=== WhoAmI (from TargetUser session) ==="
+          Get-Content "$env:TEMP\whoami.txt" -ErrorAction SilentlyContinue | Out-String | Write-Host
 
-          Write-Host "`n=== Host log (tail) ==="
-          $log = "C:\ProgramData\Google\Chrome Remote Desktop\host.log"
-          if (Test-Path $log) { Get-Content $log -Tail 150 }
+          Write-Host "`n=== CRD Service Status ==="
+          Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
 
           Write-Host "`n=== Accounts (post-enforcement) ==="
           Get-LocalUser | Select-Object Name,Enabled | Format-Table -Auto
@@ -308,8 +286,8 @@ jobs:
           Write-Host "    then open: https://remotedesktop.google.com/access"
           Write-Host "    Your host should appear as: $env:CRD_NAME"
           Write-Host "-----------------------------------------------------"
-          Write-Host "AutoAdminLogon is configured for the target user so the desktop session already exists."
-          Write-Host "Headless display forced to 1920x1080; DPI scaling set to 100% for that user."
+          Write-Host "A live desktop session for the target user has been created (no reboot needed)."
+          Write-Host "Resolution set to 1920x1080 and DPI to 100% inside that session."
           Write-Host "Note: RDP is enabled locally for completeness, but GitHub-hosted"
           Write-Host "runners do not accept inbound RDP from the internet."
           Write-Host "Use Chrome Remote Desktop (PIN: ******) for access."
