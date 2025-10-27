@@ -31,7 +31,6 @@ on:
 permissions:
   contents: read
 
-# Allow parallel runs per instance
 concurrency:
   group: enigmano-gcrd-${{ inputs.INSTANCE }}
   cancel-in-progress: true
@@ -85,44 +84,44 @@ jobs:
 
           function Pause([int]$s=3){ Start-Sleep -Seconds $s }
 
-          # ---------------- Win32 CreateProcessWithLogonW wrapper ----------------
-          $src = @'
-          using System;
-          using System.Runtime.InteropServices;
-          public static class CPWL {
-            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-            public struct STARTUPINFO {
-              public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
-              public int dwX; public int dwY; public int dwXSize; public int dwYSize;
-              public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute;
-              public int dwFlags; public short wShowWindow; public short cbReserved2;
-              public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
-            }
-            [StructLayout(LayoutKind.Sequential)]
-            public struct PROCESS_INFORMATION {
-              public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId;
-            }
-            [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-            static extern bool CreateProcessWithLogonW(
-               string userName, string domain, string password, int logonFlags,
-               string applicationName, string commandLine, int creationFlags, IntPtr environment,
-               string currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
-            public static int Run(string user,string domain,string pass,string app,string args){
-              var si=new STARTUPINFO();
-              si.cb=Marshal.SizeOf(typeof(STARTUPINFO));
-              si.lpDesktop="winsta0\\default";
-              si.dwFlags=0x00000001; /* STARTF_USESHOWWINDOW */
-              si.wShowWindow=1;      /* SW_SHOWNORMAL */
-              PROCESS_INFORMATION pi;
-              string cmd = string.IsNullOrEmpty(args) ? null : ("\"" + app + "\" " + args);
-              bool ok=CreateProcessWithLogonW(user,domain,pass,0x00000001, /* LOGON_WITH_PROFILE */
-                string.IsNullOrEmpty(args)?app:null, cmd,
-                0x00000010, /* CREATE_NEW_CONSOLE */ IntPtr.Zero,null,ref si,out pi);
-              if(!ok) return Marshal.GetLastWin32Error();
-              return 0;
-            }
-          }
-'@
+          # ---------------- Win32 CreateProcessWithLogonW wrapper (safe array-join) ----------------
+          $src = @(
+            'using System;',
+            'using System.Runtime.InteropServices;',
+            'public static class CPWL {',
+            '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+            '  public struct STARTUPINFO {',
+            '    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;',
+            '    public int dwX; public int dwY; public int dwXSize; public int dwYSize;',
+            '    public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute;',
+            '    public int dwFlags; public short wShowWindow; public short cbReserved2;',
+            '    public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;',
+            '  }',
+            '  [StructLayout(LayoutKind.Sequential)]',
+            '  public struct PROCESS_INFORMATION {',
+            '    public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId;',
+            '  }',
+            '  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]',
+            '  static extern bool CreateProcessWithLogonW(',
+            '     string userName, string domain, string password, int logonFlags,',
+            '     string applicationName, string commandLine, int creationFlags, IntPtr environment,',
+            '     string currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);',
+            '  public static int Run(string user,string domain,string pass,string app,string args){',
+            '    var si=new STARTUPINFO();',
+            '    si.cb=Marshal.SizeOf(typeof(STARTUPINFO));',
+            '    si.lpDesktop="winsta0\\\\default";',
+            '    si.dwFlags=0x00000001; /* STARTF_USESHOWWINDOW */',
+            '    si.wShowWindow=1; /* SW_SHOWNORMAL */',
+            '    PROCESS_INFORMATION pi;',
+            '    string cmd = string.IsNullOrEmpty(args) ? null : ("\"" + app + "\" " + args);',
+            '    bool ok=CreateProcessWithLogonW(user,domain,pass,0x00000001, /* LOGON_WITH_PROFILE */',
+            '      string.IsNullOrEmpty(args)?app:null, cmd,',
+            '      0x00000010, /* CREATE_NEW_CONSOLE */ IntPtr.Zero,null,ref si,out pi);',
+            '    if(!ok) return Marshal.GetLastWin32Error();',
+            '    return 0;',
+            '  }',
+            '}'
+          ) -join "`n"
           Add-Type -TypeDefinition $src -Language CSharp
 
           # ---------------- Create/ensure new admin ----------------
@@ -255,7 +254,6 @@ jobs:
             $trigger    = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(7)
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -Password $DefaultPass | Out-Null
             Start-ScheduledTask -TaskName $taskName
-            # give it time to perform host registration
             Start-Sleep -Seconds 30
             try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null } catch {}
           } catch {
@@ -290,7 +288,6 @@ jobs:
           Write-Host "`n=== Session Snapshot (runneradmin still present; console locked) ==="
           try { query user } catch {}
 
-          # Do not fail on cosmetic native exit codes
           $global:LASTEXITCODE = 0
 
       - name: "Connect instructions + keep alive"
