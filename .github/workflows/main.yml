@@ -1,4 +1,4 @@
-name: "EnigMano GCRD Windows — Magical Ultra Clean"
+name: "⚡ EnigMano GCRD Windows — Phoenix"
 
 on:
   workflow_dispatch:
@@ -49,7 +49,7 @@ jobs:
       MSI_URL: https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi
 
     steps:
-      - name: Prep variables and ensure admin user
+      - name: Prep variables + ensure admin user + AutoAdminLogon
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -61,7 +61,9 @@ jobs:
           $ttlStr      = ($env:RAW_TTL          | % { $_.Trim() })
 
           if (-not [int]::TryParse($ttlStr, [ref]0)) { $ttlStr = "120" }
-          $ttl = [int]$ttlStr; if ($ttl -lt 10) { $ttl = 10 }
+          $ttl = [int]$ttlStr
+          if ($ttl -lt 10) { $ttl = 10 }
+          $ttl = [Math]::Min($ttl, 335)  # keep under job timeout (340)
 
           $DefaultPass = $env:DEFAULT_PASS
           $Pin         = $env:FIXED_GCRD_PIN
@@ -74,7 +76,7 @@ jobs:
           $CRD_NAME = "EnigMano-$instance-$($env:GITHUB_RUN_NUMBER)"
           "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # Ensure the admin user and add to Administrators
+          # Ensure target admin
           if ($TargetUser -eq "runneradmin") {
             net user runneradmin "$DefaultPass"
             try { net localgroup Administrators runneradmin /add | Out-Null } catch {}
@@ -87,21 +89,22 @@ jobs:
             net localgroup Administrators $TargetUser /add
           }
           try { Set-LocalUser -Name $TargetUser -PasswordNeverExpires $true } catch {}
-
           Start-Sleep -Seconds 2
 
-          # AutoAdminLogon for next boots
+          # AutoAdminLogon for future boots
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
           reg add "$wl" /v DefaultUserName   /t REG_SZ    /d "$TargetUser"  /f | Out-Null
           reg add "$wl" /v DefaultDomainName /t REG_SZ    /d "$env:COMPUTERNAME" /f | Out-Null
           reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
+          Start-Sleep -Seconds 1
 
           # Keep awake
           powercfg -x -monitor-timeout-ac 0
           powercfg -x -standby-timeout-ac 0
           powercfg -x -hibernate-timeout-ac 0
+          Start-Sleep -Seconds 1
 
       - name: Install Chrome Remote Desktop host
         shell: pwsh
@@ -112,7 +115,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList @("/i",$msi,"/qn","/norestart") -Wait
           Start-Sleep -Seconds 4
 
-      - name: Register CRD under target user
+      - name: Register CRD (user context with elevation-safe fallback)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -124,7 +127,7 @@ jobs:
           $redirectUrl = $env:RAW_REDIRECT_URL
           $setupInput  = $env:RAW_SETUP
 
-          # Find CRD host binary (handle path drift)
+          # Find CRD host binary (path drift safe)
           $pf86 = [Environment]::GetFolderPath('ProgramFilesX86'); $pf64 = $env:ProgramFiles
           $cands = @(
             (Join-Path $pf86 'Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe'),
@@ -135,13 +138,13 @@ jobs:
           $CRD_EXE = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $CRD_EXE) { throw "remoting_start_host.exe not found." }
 
-          # Stable CRD policies
+          # Policies
           reg add HKLM\Software\Policies\Google\Chrome /v RemoteAccessHostRequireCurtain /d 1 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /d 0 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /d 1 /t REG_DWORD /f | Out-Null
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /d 0 /t REG_DWORD /f | Out-Null
 
-          # Parse OAuth code robustly
+          # Parse OAuth code
           $code = $null
           if ($setupInput -match 'code="?([0-9A-Za-z\/\-\._~]+)"?') { $code = $Matches[1] }
           elseif ($setupInput -match '(4\/[0-9A-Za-z\-\._~]+)')     { $code = $Matches[1] }
@@ -150,18 +153,18 @@ jobs:
 
           $args = @("--code=""$code""","--redirect-url=""$redirectUrl""","--name=""$CRD_NAME""","--pin=""$Pin""") -join " "
 
-          # Preferred: register in the target user's context directly
+          # Try direct (often blocked by elevation) → fallback to scheduled task
           $sec  = ConvertTo-SecureString $DefaultPass -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$TargetUser",$sec)
-          $crdOk = $false
+          $ok = $false
           try {
             Start-Process -FilePath $CRD_EXE -ArgumentList $args -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait
-            $crdOk = $true
+            $ok = $true
           } catch {
-            Write-Host "Direct CRD register failed ($($_.Exception.Message)). Falling back to scheduled task."
+            Write-Host "Direct CRD register failed ($($_.Exception.Message)). Using scheduled task fallback."
           }
 
-          if (-not $crdOk) {
+          if (-not $ok) {
             $task = "CRD-Register-$CRD_NAME"
             $cmd  = Join-Path $env:TEMP "crd_register.cmd"
             "@echo off`r`n""$CRD_EXE"" $args`r`nexit /b %errorlevel%" | Out-File -FilePath $cmd -Encoding ASCII -Force
@@ -172,7 +175,7 @@ jobs:
             Start-Sleep -Seconds 8
           }
 
-          # Start CRD service with retry
+          # Ensure CRD service running
           function TryStart([string]$n){
             $s = Get-Service -Name $n -EA SilentlyContinue
             if ($s) {
@@ -190,8 +193,9 @@ jobs:
             $svc2 = Get-Service -DisplayName "Chrome Remote Desktop Service" -EA SilentlyContinue
             if ($svc2) { [void](TryStart $svc2.Name) }
           }
+          Start-Sleep -Seconds 2
 
-      - name: Force logged-on desktop session for target user
+      - name: Force logged-on desktop for target user (now)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -201,7 +205,6 @@ jobs:
           $sec  = ConvertTo-SecureString $DefaultPass -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$TargetUser",$sec)
 
-          # Launch user shell to create a real session now
           try {
             Start-Process -FilePath "$env:WINDIR\System32\userinit.exe" -ArgumentList "$env:WINDIR\explorer.exe" -Credential $cred -LoadUserProfile -WindowStyle Hidden
             Start-Sleep -Seconds 3
@@ -209,13 +212,12 @@ jobs:
             Write-Host "Userinit launch warning: $($_.Exception.Message)"
           }
 
-          # Show any explorer owners
           try {
             $procs = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'"
             foreach ($p in $procs){ $null=$p.GetOwner([ref]$u,[ref]$d); if ($u) { Write-Host "Explorer owned by: $d\$u" } }
           } catch {}
 
-      - name: Apply selected 1920x1080 in user session (Win32 API) with fallback
+      - name: Apply 1920x1080 in user session (Win32 API) with fallback
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -225,48 +227,49 @@ jobs:
           $sec  = ConvertTo-SecureString $DefaultPass -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$TargetUser",$sec)
 
-          # Build a tiny PS1 that compiles and calls ChangeDisplaySettings
+          # Build small script using single-quoted here-string to avoid escaping issues
           $setResPs1 = Join-Path $env:TEMP "apply_res.ps1"
-          $lines = @()
-          $lines += "Add-Type -TypeDefinition @'"
-          $lines += "using System;"
-          $lines += "using System.Runtime.InteropServices;"
-          $lines += "public class SetRes {"
-          $lines += "  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]"
-          $lines += "  public struct DEVMODE {"
-          $lines += "    private const int CCHDEVICENAME = 32, CCHFORMNAME = 32;"
-          $lines += "    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCHDEVICENAME)] public string dmDeviceName;"
-          $lines += "    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;"
-          $lines += "    public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;"
-          $lines += "    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;"
-          $lines += "    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCHFORMNAME)] public string dmFormName;"
-          $lines += "    public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;"
-          $lines += "    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;"
-          $lines += "  }"
-          $lines += "  [DllImport(\"user32.dll\", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettings(ref DEVMODE devMode, int flags);"
-          $lines += "  [DllImport(\"user32.dll\", CharSet=CharSet.Ansi)] public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);"
-          $lines += "  public static int Apply(int w, int h, int bpp, int hz){"
-          $lines += "    const int ENUM_CURRENT_SETTINGS = -1, CDS_UPDATEREGISTRY = 0x01, DM_PELSWIDTH=0x80000, DM_PELSHEIGHT=0x100000, DM_BITSPERPEL=0x40000;"
-          $lines += "    DEVMODE dm = new DEVMODE(); dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));"
-          $lines += "    if (!EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm)) return -999;"
-          $lines += "    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;"
-          $lines += "    dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmBitsPerPel = bpp; dm.dmDisplayFrequency = hz;"
-          $lines += "    return ChangeDisplaySettings(ref dm, CDS_UPDATEREGISTRY);"
-          $lines += "  }"
-          $lines += "}"
-          $lines += "'@"
-          $lines += '$rc = [SetRes]::Apply(1920,1080,32,60)'
-          $lines += 'Write-Host "ChangeDisplaySettings returned: $rc"'
-          $lines += 'if ($rc -ne 0) { exit 1 }'
-          Set-Content -Path $setResPs1 -Value $lines -Encoding ASCII
+          $psContent = @'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class SetRes {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+  public struct DEVMODE {
+    private const int CCHDEVICENAME = 32, CCHFORMNAME = 32;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCHDEVICENAME)] public string dmDeviceName;
+    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+    public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCHFORMNAME)] public string dmFormName;
+    public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+  }
+  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern int ChangeDisplaySettings(ref DEVMODE devMode, int flags);
+  [DllImport("user32.dll", CharSet=CharSet.Ansi)] public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+  public static int Apply(int w, int h, int bpp, int hz){
+    const int ENUM_CURRENT_SETTINGS = -1, CDS_UPDATEREGISTRY = 0x01, DM_PELSWIDTH=0x80000, DM_PELSHEIGHT=0x100000, DM_BITSPERPEL=0x40000;
+    const int DISP_CHANGE_SUCCESSFUL = 0;
+    DEVMODE dm = new DEVMODE(); dm.dmSize = (short)System.Runtime.InteropServices.Marshal.SizeOf(typeof(DEVMODE));
+    if (!EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm)) return -999;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+    dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmBitsPerPel = bpp; dm.dmDisplayFrequency = hz;
+    return ChangeDisplaySettings(ref dm, CDS_UPDATEREGISTRY);
+  }
+}
+"@
+$rc = [SetRes]::Apply(1920,1080,32,60)
+Write-Host "ChangeDisplaySettings returned: $rc"
+if ($rc -ne 0) { exit 1 }
+'@
+          Set-Content -Path $setResPs1 -Value $psContent -Encoding ASCII
 
-          # Run it under the target user's token
           $ok = $true
           try {
             Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$setResPs1`"" -Credential $cred -LoadUserProfile -WindowStyle Hidden -Wait
           } catch {
             $ok = $false
-            Write-Host "Win32 API resolution apply failed: $($_.Exception.Message)"
+            Write-Host "Win32 resolution apply failed: $($_.Exception.Message)"
           }
 
           if (-not $ok) {
@@ -289,8 +292,9 @@ jobs:
             }
             Set-HeadlessRes 1920 1080
           }
+          Start-Sleep -Seconds 2
 
-          # 100% DPI
+          # 100% DPI for target user
           try {
             $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
             $profilePath = (Get-CimInstance Win32_UserProfile -EA SilentlyContinue | ? { $_.SID -eq $sid }).LocalPath
@@ -306,15 +310,15 @@ jobs:
             }
           } catch {}
 
-      - name: Verify and keep alive
+      - name: Verify + keep alive
         if: ${{ always() }}
         shell: pwsh
         run: |
           Write-Host "====================================================="
           Write-Host " Chrome Remote Desktop registered as: $env:CRD_NAME"
-          Write-Host " Target user is launched (userinit + explorer) for a live desktop."
-          Write-Host " Resolution requested: 1920x1080 (Win32 API; registry fallback if needed)."
-          Write-Host " DPI scaling set to 100%."
+          Write-Host " Target user has an active desktop (userinit + explorer)."
+          Write-Host " Resolution: 1920x1080 requested via Win32 API (registry fallback if needed)."
+          Write-Host " DPI: 100%. Sleep disabled. TTL: $env:TTL_MIN minutes."
           Write-Host "====================================================="
 
           Write-Host "`n=== CRD Service Status ==="
@@ -326,7 +330,7 @@ jobs:
             Get-Content $log -Tail 120
           }
 
-          Write-Host "`n=== Explorer owners (expect to see target user) ==="
+          Write-Host "`n=== Explorer owners (expect to see the target user) ==="
           try {
             $procs = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'"
             foreach ($p in $procs){ $null=$p.GetOwner([ref]$u,[ref]$d); if ($u) { Write-Host "Explorer owned by: $d\$u" } }
