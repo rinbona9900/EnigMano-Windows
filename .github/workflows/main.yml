@@ -1,4 +1,4 @@
-name: "⚡ EnigMano GCRD Windows — Lock & Auto-Logon Magic"
+name: "⚡ EnigMano GCRD Windows — Lock & Auto-Logon Final Magic"
 
 on:
   workflow_dispatch:
@@ -46,19 +46,19 @@ jobs:
       RAW_TTL:        ${{ inputs.TTL_MINUTES }}
       DISP_W:         ${{ inputs.DISPLAY_WIDTH }}
       DISP_H:         ${{ inputs.DISPLAY_HEIGHT }}
-      DEFAULT_PASS:   "EnigMan0"      # fixed local password
+      DEFAULT_PASS:   "EnigMan0"      # fixed password for all local users
       FIXED_GCRD_PIN: "36446266"      # fixed CRD PIN
       REDIRECT_URL:   "https://remotedesktop.google.com/_/oauthredirect"
       MSI_URL:        "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
 
     steps:
-      - name: "Create admin → AutoAdminLogon → CRD install/register → headless desktop → lock → verify"
+      - name: "Create admin → unify passwords → CRD install/register → warm desktop → lock & verify"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          # ---------------- Basics & inputs ----------------
+          # ---------------- Inputs ----------------
           $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
           ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
           if (-not $isAdmin) { throw "This workflow requires administrative privileges. Current token is not elevated." }
@@ -82,20 +82,17 @@ jobs:
           "TTL_MIN=$ttl"       | Out-File -FilePath $env:GITHUB_ENV -Append
           "CRD_NAME=$CRD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # Small delays between critical ops
           function Pause([int]$s=3){ Start-Sleep -Seconds $s }
 
-          # Helper: compute future schedule (prevents /ST earlier than current time)
-          function Get-FutureSchedule([int]$MinutesAhead=15) {
+          # helpers
+          function Get-FutureSchedule([int]$MinutesAhead=12) {
             $t = (Get-Date).AddMinutes($MinutesAhead)
             [pscustomobject]@{ SD = $t.ToString('MM/dd/yyyy'); ST = $t.ToString('HH:mm') }
           }
-
-          # Helper: schtasks wrappers (robust arg passing)
           function Sch-Delete([string]$Name){
             Start-Process -FilePath schtasks.exe -ArgumentList @('/delete','/tn',$Name,'/f') -Wait -NoNewWindow -ErrorAction SilentlyContinue | Out-Null
           }
-          function Sch-Create([string]$Name,[string]$Cmd,[string]$RunAs,[string]$Pass,[int]$MinutesAhead=15){
+          function Sch-Create([string]$Name,[string]$Cmd,[string]$RunAs,[string]$Pass,[int]$MinutesAhead=12){
             $sched = Get-FutureSchedule -MinutesAhead $MinutesAhead
             Start-Process -FilePath schtasks.exe -ArgumentList @(
               '/create','/tn',$Name,'/tr',"`"$Cmd`"","/sc",'ONCE','/sd',$sched.SD,'/st',$sched.ST,
@@ -107,9 +104,9 @@ jobs:
           }
 
           Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue
-          Pause 1
+          Pause 2
 
-          # ---------------- (1) Create the new local admin (others untouched) ----------------
+          # ---------------- (1) Create/ensure the new local admin ----------------
           if (-not (Get-LocalUser -Name $TargetUser -ErrorAction SilentlyContinue)) {
             & net user $TargetUser "$DefaultPass" /add
           } else {
@@ -125,7 +122,14 @@ jobs:
           }
           Pause 2
 
-          # ---------------- (2) AutoAdminLogon to new user (applies next boot) ----------------
+          # ---------------- (2) Set SAME PASSWORD for ALL local users (best-effort) ----------------
+          Get-LocalUser | ForEach-Object {
+            $n = $_.Name
+            try { & net user $n "$DefaultPass" | Out-Null } catch {}
+          }
+          Pause 3
+
+          # ---------------- (3) AutoAdminLogon (applies next boot; we still warm-in now) ----------------
           $wl = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
           & reg add "$wl" /v AutoAdminLogon    /t REG_SZ    /d "1"            /f | Out-Null
           & reg add "$wl" /v ForceAutoLogon    /t REG_DWORD /d 1              /f | Out-Null
@@ -134,19 +138,19 @@ jobs:
           & reg add "$wl" /v DefaultPassword   /t REG_SZ    /d "$DefaultPass" /f | Out-Null
           Pause 3
 
-          # Cosmetic; does NOT hide/disable anyone (runneradmin stays)
+          # cosmetic only
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DontDisplayLastUsername /t REG_DWORD /d 1 /f | Out-Null
           reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v HideFastUserSwitching  /t REG_DWORD /d 1 /f | Out-Null
           Pause 2
 
-          # ---------------- (3) Local RDP (informational) ----------------
+          # ---------------- (4) Local RDP (informational; CRD is what you'll use) ----------------
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-Service -Name TermService -StartupType Automatic
           try { Start-Service TermService } catch {}
           Pause 3
 
-          # ---------------- (4) Install Chrome Remote Desktop Host ----------------
+          # ---------------- (5) Install Chrome Remote Desktop Host ----------------
           $WorkDir = Join-Path $env:ProgramData "EnigMano"
           New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
           Pause 2
@@ -157,7 +161,6 @@ jobs:
           Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i",$msi,"/qn","/norestart") -Wait -NoNewWindow
           Pause 5
 
-          # Discover remoting_start_host.exe robustly
           $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
           $CRD_EXE = $null
           $cand = Get-ChildItem -Path (Join-Path $pf86 'Google\Chrome Remote Desktop') -Recurse -Filter "remoting_start_host.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
@@ -169,7 +172,7 @@ jobs:
           if ($svc) { sc.exe config chromoting start= auto | Out-Null }
           Pause 3
 
-          # Parse OAuth code (full command or bare 4/...)
+          # parse OAuth code
           $code = $null
           if     ($setupInput -match 'code="?([^"\s]+)"?') { $code = $Matches[1] }
           elseif ($setupInput -match '(4\/[A-Za-z0-9._~-]+)') { $code = $Matches[1] }
@@ -177,7 +180,7 @@ jobs:
           Write-Output "::add-mask::$code"
           Pause 1
 
-          # ---------------- (5) Register CRD host AS the new user (fixed PIN) ----------------
+          # ---------------- (6) Register CRD host AS the new user (fixed PIN) ----------------
           $CRD_ARGS = "--code=""$code"" --redirect-url=""$($env:REDIRECT_URL)"" --name=""$CRD_NAME"" --pin=""$CRD_PIN"""
           $regCmd   = Join-Path $WorkDir "crd_register.cmd"
           Set-Content -Path $regCmd -Value @(
@@ -190,13 +193,12 @@ jobs:
           $runAs   = "$($env:COMPUTERNAME)\$TargetUser"
           $regTask = "CRD-Register-$CRD_NAME"
           Sch-Delete $regTask
-          Sch-Create -Name $regTask -Cmd $regCmd -RunAs $runAs -Pass $DefaultPass -MinutesAhead 15
+          Sch-Create -Name $regTask -Cmd $regCmd -RunAs $runAs -Pass $DefaultPass -MinutesAhead 12
           Pause 4
           Sch-Run $regTask
           Pause 12
 
-          # ---------------- (6) Logon new user headlessly (desktop + keepalive) ----------------
-          # Desktop warm-in: start explorer.exe under the new user
+          # ---------------- (7) Logon new user headlessly (desktop + keepalive) ----------------
           $warmCmd = Join-Path $WorkDir "warmin.cmd"
           Set-Content -Path $warmCmd -Value @(
             '@echo off'
@@ -208,12 +210,11 @@ jobs:
 
           $warmTask = "CRD-WarmIn-$CRD_NAME"
           Sch-Delete $warmTask
-          Sch-Create -Name $warmTask -Cmd $warmCmd -RunAs $runAs -Pass $DefaultPass -MinutesAhead 16
+          Sch-Create -Name $warmTask -Cmd $warmCmd -RunAs $runAs -Pass $DefaultPass -MinutesAhead 13
           Pause 4
           Sch-Run $warmTask
           Pause 10
 
-          # Keep-alive: keeps the user's token/session warm for CRD
           $keepCmd = Join-Path $WorkDir "keepalive.cmd"
           Set-Content -Path $keepCmd -Value @(
             '@echo off'
@@ -225,21 +226,18 @@ jobs:
 
           $keepTask = "CRD-KeepAlive-$CRD_NAME"
           Sch-Delete $keepTask
-          Sch-Create -Name $keepTask -Cmd $keepCmd -RunAs $runAs -Pass $DefaultPass -MinutesAhead 17
+          Sch-Create -Name $keepTask -Cmd $keepCmd -RunAs $runAs -Pass $DefaultPass -MinutesAhead 14
           Pause 4
           Sch-Run $keepTask
           Pause 8
 
-          # Wait up to 60s for HKU\<SID> to mount (proof of logon/profile load)
+          # Wait for HKU\<SID> to mount = profile loaded
           $sid = (Get-LocalUser -Name $TargetUser).Sid.Value
           $mounted = $false
-          foreach ($i in 1..60) {
-            if (Test-Path "Registry::HKEY_USERS\$sid") { $mounted = $true; break }
-            Start-Sleep -Seconds 1
-          }
+          foreach ($i in 1..60) { if (Test-Path "Registry::HKEY_USERS\$sid") { $mounted = $true; break }; Start-Sleep -Seconds 1 }
           Pause 2
 
-          # ---------------- (7) DPI 100% (per-user) & default headless resolution ----------------
+          # ---------------- (8) DPI 100% (per-user) & default headless resolution ----------------
           if ($mounted) {
             reg add "HKU\$sid\Control Panel\Desktop" /v LogPixels /t REG_DWORD /d 96 /f | Out-Null
             reg add "HKU\$sid\Control Panel\Desktop" /v Win8DpiScaling /t REG_DWORD /d 0 /f | Out-Null
@@ -268,7 +266,7 @@ jobs:
           Set-HeadlessRes -W $W -H $H
           Pause 3
 
-          # Soft-apply without reboot
+          # Soft-apply display without reboot
           try {
             Import-Module PnpDevice -ErrorAction SilentlyContinue
             $disp = Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -280,14 +278,33 @@ jobs:
           } catch {}
           Pause 3
 
-          # ---------------- (8) LOCK the console (runneradmin stays alive in background) ----------------
-          # Lock runneradmin's console session; CRD will use the new user's session/token.
+          # ---------------- (9) LOCK console (runneradmin stays alive) ----------------
           try {
             Start-Process -FilePath "$env:SystemRoot\System32\rundll32.exe" -ArgumentList 'user32.dll,LockWorkStation' -NoNewWindow -Wait
           } catch {}
+          Pause 6
+
+          # After lock: re-assert new user session (run warm/keep again) and verify
+          Sch-Run $warmTask
+          Pause 8
+          Sch-Run $keepTask
           Pause 5
 
-          # Ensure CRD is running
+          # Verify: processes by TargetUser; if missing, retry a few times
+          $maxRetries = 4
+          for ($try=1; $try -le $maxRetries; $try++) {
+            $procs = @()
+            try { $procs = Get-Process -IncludeUserName | Where-Object { $_.UserName -like "*\$TargetUser" } } catch {}
+            $hiveLoaded = Test-Path "Registry::HKEY_USERS\$sid"
+            if ($procs.Count -gt 0 -and $hiveLoaded) { break }
+            # re-run warm/keep and wait a bit more
+            Sch-Run $warmTask
+            Pause 10
+            Sch-Run $keepTask
+            Pause 10
+          }
+
+          # Ensure CRD service is running
           function TryStart([string]$name) {
             $ErrorActionPreference = "Continue"
             $s = Get-Service -Name $name -ErrorAction SilentlyContinue
@@ -309,7 +326,7 @@ jobs:
           Write-Host "=== CRD Service Status ==="
           Get-Service -Name chromoting -ErrorAction SilentlyContinue | Format-Table -Auto
 
-          Write-Host "`n=== Local Users (new user added; others untouched) ==="
+          Write-Host "`n=== Local Users (password unified; all untouched) ==="
           Get-LocalUser | Select-Object Name,Enabled | Format-Table -Auto
 
           Write-Host "`n=== AutoAdminLogon Target ==="
@@ -318,11 +335,8 @@ jobs:
           Write-Host "`n=== Session Snapshot (runneradmin locked; background alive) ==="
           try { query user } catch {}
 
-          Write-Host "`n=== Processes owned by $TargetUser (active token/session) ==="
+          Write-Host "`n=== Processes owned by $TargetUser (proof of active session) ==="
           try { Get-Process -IncludeUserName | Where-Object { $_.UserName -like "*\$TargetUser" } | Select-Object Name,Id,SessionId,UserName | Format-Table -Auto } catch {}
-
-          Write-Host "`n=== Display Devices ==="
-          try { Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Format-Table -Auto } catch {}
 
           # Do not fail on harmless native exit codes
           $global:LASTEXITCODE = 0
@@ -332,13 +346,13 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "====================================================="
-          Write-Host " ✅ Chrome Remote Desktop registration complete."
+          Write-Host " ✅ Chrome Remote Desktop is registered."
           Write-Host "    Host: $env:CRD_NAME"
-          Write-Host "    Open: https://remotedesktop.google.com/access (same Google account as your code)"
+          Write-Host "    Open: https://remotedesktop.google.com/access (same Google account used for the code)"
           Write-Host "-----------------------------------------------------"
-          Write-Host "Console user (runneradmin) was locked; it stays alive in the background."
-          Write-Host "New user session is warm and active (desktop + keepalive), so CRD attaches cleanly."
-          Write-Host "Headless display set to $env:DISP_W x $env:DISP_H; DPI 100%."
-          Write-Host "No other users were disabled, hidden, or signed out."
+          Write-Host "Passwords unified to 'EnigMan0' for all local users (best-effort)."
+          Write-Host "Console (runneradmin) is locked and stays alive in background."
+          Write-Host "New user session is warm & active (desktop + keepalive)."
+          Write-Host "Headless display: $env:DISP_W x $env:DISP_H; DPI 100%."
           Write-Host "====================================================="
           Start-Sleep -Seconds (60 * [int]$env:TTL_MIN)
